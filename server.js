@@ -32,6 +32,9 @@ app.use(helmet({
   hsts: { maxAge: 31536000, includeSubDomains: true, preload: true }
 }));
 
+// Trust proxy for Render deployment and rate limiting
+app.set('trust proxy', process.env.NODE_ENV === 'production' ? 1 : false);
+
 // CORS configuration
 const allowedOrigins = [
   ...(process.env.FRONTEND_URL || '').split(','),
