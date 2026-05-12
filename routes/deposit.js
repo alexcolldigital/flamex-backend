@@ -84,6 +84,21 @@ router.post('/ngn', authMiddleware, [
   const user = await User.findById(req.userId);
   const amount = Number(req.body.amount);
   const reference = `DP-NGN-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+  const customerName = [user.firstName, user.lastName].filter(Boolean).join(' ').trim();
+  const customerBvn = String(user.bvn || '').trim();
+  const customerNin = String(user.nin || '').trim();
+
+  if (!customerName) {
+    throw new AppError('Profile name is required before creating a deposit account', 400);
+  }
+
+  if (!user.email) {
+    throw new AppError('Email is required before creating a deposit account', 400);
+  }
+
+  if (!customerBvn && !customerNin) {
+    throw new AppError('Complete BVN or NIN verification before requesting an NGN deposit account', 400);
+  }
 
   let bankDetails = null;
   let monnifyResult = null;
@@ -92,20 +107,28 @@ router.post('/ngn', authMiddleware, [
     if (monnifyService.isConfigured) {
       monnifyResult = await monnifyService.createReservedAccount({
         userId: user._id.toString(),
-        userName: `${user.firstName} ${user.lastName}`,
+        userName: customerName,
         email: user.email,
-        bvn: user.kyc?.bvn || '',
-        phoneNumber: user.phone
+        bvn: customerBvn,
+        nin: customerNin
       });
 
       if (monnifyResult.success) {
+        const primaryAccount = monnifyResult.accounts?.[0] || {};
         bankDetails = {
-          bankName: monnifyResult.bank?.name || 'Wema Bank',
-          bankCode: monnifyResult.bank?.code || '035',
-          accountNumber: monnifyResult.accounts?.[0]?.accountNumber || '',
-          accountName: monnifyResult.accounts?.[0]?.accountName || `${user.firstName} ${user.lastName}`,
-          monnifyAccountId: monnifyResult.accounts?.[0]?.accountNumber || null
+          bankName: primaryAccount.bankName || monnifyResult.bank?.name || 'Monnify',
+          bankCode: primaryAccount.bankCode || monnifyResult.bank?.code || '',
+          accountNumber: primaryAccount.accountNumber || '',
+          accountName: primaryAccount.accountName || customerName,
+          monnifyAccountId: primaryAccount.accountNumber || null,
+          accountReference: monnifyResult.accountReference || null,
+          reservationReference: monnifyResult.reservationReference || null
         };
+      } else {
+        logger.warn('Monnify reserved account creation failed', {
+          userId: req.userId,
+          error: monnifyResult.error
+        });
       }
     }
   } catch (error) {
@@ -114,7 +137,7 @@ router.post('/ngn', authMiddleware, [
   }
 
   if (!bankDetails) {
-    throw new AppError('Bank account creation service not available', 503);
+    throw new AppError(monnifyResult?.error || 'Bank account creation service not available', 503);
   }
 
   // Create transaction record

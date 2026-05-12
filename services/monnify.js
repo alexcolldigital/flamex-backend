@@ -58,20 +58,53 @@ class MonnifyService {
       return { success: false, error: 'Monnify not configured' };
     }
 
-    const { userId, userName, email, bvn, phoneNumber } = params;
+    const { userId, userName, email, bvn, nin } = params;
+    const customerName = String(userName || '').trim();
+    const customerEmail = String(email || '').trim().toLowerCase();
+    const customerBvn = String(bvn || '').trim();
+    const customerNin = String(nin || '').trim();
+
+    if (!userId) {
+      return { success: false, error: 'User ID is required for reserved account creation' };
+    }
+
+    if (!customerName) {
+      return { success: false, error: 'Customer name is required for reserved account creation' };
+    }
+
+    if (!customerEmail) {
+      return { success: false, error: 'Customer email is required for reserved account creation' };
+    }
+
+    if (!customerBvn && !customerNin) {
+      return { success: false, error: 'BVN or NIN is required for reserved account creation' };
+    }
 
     try {
       const auth = await this.getAuthToken();
       if (!auth.success) return auth;
 
+      const payload = {
+        accountReference: `FLAMEX_${userId}_${Date.now()}`,
+        accountName: customerName,
+        currencyCode: 'NGN',
+        contractCode: this.contractCode,
+        customerEmail,
+        customerName,
+        getAllAvailableBanks: true
+      };
+
+      if (customerBvn) {
+        payload.bvn = customerBvn;
+      }
+
+      if (customerNin) {
+        payload.nin = customerNin;
+      }
+
       const response = await axios.post(
         `${this.baseUrl}/api/v2/bank-transfer/reserved-accounts`,
-        {
-          accountReference: `FLAMEX_${userId}_${Date.now()}`,
-          accountName: userName || 'User',
-          currencyCode: 'NGN',
-          contractCode: this.contractCode
-        },
+        payload,
         {
           headers: {
             'Authorization': `Bearer ${auth.accessToken}`,
@@ -84,11 +117,20 @@ class MonnifyService {
         success: true,
         accountReference: response.data.responseBody.accountReference,
         accounts: response.data.responseBody.accounts,
-        bank: response.data.responseBody.bank
+        bank: response.data.responseBody.bank,
+        customerName: response.data.responseBody.customerName,
+        customerEmail: response.data.responseBody.customerEmail,
+        reservationReference: response.data.responseBody.reservationReference
       };
     } catch (error) {
       console.error('Monnify create account error:', error.response?.data || error.message);
-      return { success: false, error: error.response?.data?.message || error.message };
+      return {
+        success: false,
+        error:
+          error.response?.data?.responseMessage ||
+          error.response?.data?.message ||
+          error.message
+      };
     }
   }
 
