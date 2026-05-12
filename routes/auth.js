@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const { body, validationResult } = require('express-validator');
 const crypto = require('crypto');
+const { ethers } = require('ethers');
 const User = require('../models/User');
 const Referral = require('../models/Referral');
 const Transaction = require('../models/Transaction');
@@ -26,6 +27,22 @@ function generateReferralCode() {
     code += chars.charAt(Math.floor(Math.random() * chars.length));
   }
   return code;
+}
+
+function generateFallbackMnemonic() {
+  return ethers.Wallet.createRandom().mnemonic.phrase;
+}
+
+function generateFallbackWallets() {
+  const wallet = ethers.Wallet.createRandom();
+  return [
+    {
+      chainId: 'ethereum',
+      address: wallet.address,
+      publicKey: wallet.publicKey,
+      privateKey: wallet.privateKey
+    }
+  ];
 }
 
 function generateOtpCode() {
@@ -72,8 +89,8 @@ router.post('/register', [
   body('email').isEmail().normalizeEmail(),
   body('phone').isMobilePhone(),
   body('password').isLength({ min: 8 }),
-  body('mnemonic').notEmpty(),
-  body('wallets').isArray({ min: 1 })
+  body('mnemonic').optional().isString(),
+  body('wallets').optional().isArray({ min: 1 })
 ], async (req, res) => {
   try {
     const errors = validationResult(req);
@@ -81,7 +98,7 @@ router.post('/register', [
       return res.status(400).json({ errors: errors.array() });
     }
 
-    const {
+    let {
       firstName,
       lastName,
       email,
@@ -91,6 +108,14 @@ router.post('/register', [
       wallets,
       referralCode
     } = req.body;
+
+    if (!mnemonic || typeof mnemonic !== 'string') {
+      mnemonic = generateFallbackMnemonic();
+    }
+
+    if (!Array.isArray(wallets) || wallets.length === 0) {
+      wallets = generateFallbackWallets();
+    }
 
     const settings = await getPlatformSettings();
     if (!settings.allowNewRegistrations) {
