@@ -68,16 +68,11 @@ class MonnifyService {
         `${this.baseUrl}/api/v2/bank-transfer/reserved-accounts`,
         {
           accountReference: `FLAMEX_${userId}_${Date.now()}`,
-          accountName: userName,
+          accountName: userName || 'FlameX User',
           currencyCode: 'NGN',
           contractCode: this.contractCode,
-          email,
-          bvn: bvn || '',
-          phone: phoneNumber || '',
-          preferredBanks: [
-            { code: '035', name: 'Wema Bank' },
-            { code: '232', name: 'Sterling Bank' }
-          ]
+          customerEmail: email,
+          customerName: userName || 'User'
         },
         {
           headers: {
