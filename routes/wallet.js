@@ -15,7 +15,10 @@ const CHAIN_METADATA = [
 ];
 
 const createUserSecret = (password) => {
-  return `${password}:${process.env.JWT_SECRET || 'flamex-secret-key-change-in-production'}`;
+  if (!process.env.ENCRYPTION_KEY) {
+    throw new Error('ENCRYPTION_KEY must be set before exporting wallet keys');
+  }
+  return `${password}:${process.env.ENCRYPTION_KEY}`;
 };
 
 function buildWalletSummary(user) {

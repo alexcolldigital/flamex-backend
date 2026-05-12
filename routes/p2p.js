@@ -20,6 +20,10 @@ const {
   isP2PAdmin
 } = require('../utils/p2p');
 const { requireVerifiedKycForTransactions } = require('../middleware/kyc');
+const { AppError, handleError, asyncHandler } = require('../utils/errorHandler');
+const { withTransaction } = require('../utils/database');
+const { createNotification } = require('../services/notifications');
+const Logger = require('../utils/logger');
 
 const toOfferPayload = (offer, viewerId = null) => ({
   id: offer._id,
@@ -321,44 +325,62 @@ router.post(
   authMiddleware,
   requireVerifiedKycForTransactions,
   [param('offerId').isMongoId(), body('cryptoAmount').isFloat({ min: 0.000001 })],
-  async (req, res) => {
-    try {
-      if (!hasValidRequest(req, res)) return;
+  asyncHandler(async (req, res) => {
+    const logger = new Logger('p2p/take-offer');
+    
+    if (!hasValidRequest(req, res)) return;
 
-      const offer = await P2POffer.findById(req.params.offerId);
-      if (!offer || offer.status !== 'open') {
-        return res.status(404).json({ message: 'Offer not available' });
-      }
+    const offer = await P2POffer.findById(req.params.offerId);
+    if (!offer || offer.status !== 'open') {
+      throw new AppError('Offer not available', 404);
+    }
 
-      if (String(offer.creatorId) === String(req.userId)) {
-        return res.status(400).json({ message: 'You cannot take your own offer' });
-      }
+    if (String(offer.creatorId) === String(req.userId)) {
+      throw new AppError('You cannot take your own offer', 400);
+    }
 
-      const cryptoAmount = Number(req.body.cryptoAmount);
-      if (cryptoAmount < offer.minOrderAmount || cryptoAmount > offer.maxOrderAmount) {
-        return res.status(400).json({ message: 'Order amount is outside this offer range' });
-      }
+    const cryptoAmount = Number(req.body.cryptoAmount);
+    if (cryptoAmount < offer.minOrderAmount || cryptoAmount > offer.maxOrderAmount) {
+      throw new AppError('Order amount is outside this offer range', 400);
+    }
 
-      if (cryptoAmount > offer.availableAmount) {
-        return res.status(400).json({ message: 'Offer does not have enough available liquidity' });
-      }
+    if (cryptoAmount > offer.availableAmount) {
+      throw new AppError('Offer does not have enough available liquidity', 400);
+    }
 
-      const [maker, taker] = await Promise.all([User.findById(offer.creatorId), User.findById(req.userId)]);
-      const seller = offer.side === 'sell' ? maker : taker;
-      const buyer = offer.side === 'sell' ? taker : maker;
+    const [maker, taker] = await Promise.all([User.findById(offer.creatorId), User.findById(req.userId)]);
+    const seller = offer.side === 'sell' ? maker : taker;
+    const buyer = offer.side === 'sell' ? taker : maker;
 
-      if (offer.side === 'buy' && !getDefaultBankAccount(seller)) {
-        return res.status(400).json({ message: 'Add a bank account before selling into a buy offer' });
-      }
+    if (offer.side === 'buy' && !getDefaultBankAccount(seller)) {
+      throw new AppError('Add a bank account before selling into a buy offer', 400);
+    }
 
+    // FIX: Check available balance AFTER locked balances (not just total balance)
+    const sellerBalance = seller.balances[offer.asset] || 0;
+    const sellerLockedBalance = seller.lockedBalances?.[offer.asset] || 0;
+    const sellerAvailableBalance = sellerBalance - sellerLockedBalance;
+
+    if (sellerAvailableBalance < cryptoAmount) {
+      throw new AppError(
+        `Insufficient available ${offer.asset} balance. Available: ${sellerAvailableBalance}, Required: ${cryptoAmount}`,
+        400
+      );
+    }
+
+    // Use transaction to ensure atomicity
+    return withTransaction(async (session) => {
+      // Lock the funds within the transaction
       lockFunds(seller, offer.asset, cryptoAmount);
 
+      // Update offer
       offer.availableAmount = Math.max(0, Number(offer.availableAmount) - cryptoAmount);
       if (offer.availableAmount === 0) {
         offer.status = 'completed';
       }
       offer.updatedAt = new Date();
 
+      // Create order
       const order = new P2POrder({
         offerId: offer._id,
         offerOwnerId: maker._id,
@@ -382,19 +404,41 @@ router.post(
                 instructions: offer.paymentDetails?.instructions || offer.terms || null
               }
             : getDefaultBankAccount(seller),
+        // FIX: Set proper expiration time
         expiresAt: new Date(Date.now() + offer.paymentWindowMinutes * 60 * 1000),
         reference: `P2P-${Date.now()}-${Math.random().toString(36).slice(2, 8).toUpperCase()}`
       });
 
-      await Promise.all([seller.save(), offer.save(), order.save()]);
+      await Promise.all([
+        seller.save({ session }),
+        offer.save({ session }),
+        order.save({ session })
+      ]);
+
+      logger.info(`P2P order created: ${order.reference}, seller: ${seller._id}, buyer: ${buyer._id}, amount: ${cryptoAmount} ${offer.asset}`);
+
+      // Send notifications
+      await createNotification({
+        user: buyer,
+        type: 'receive',
+        title: 'P2P order created',
+        body: `You have a pending P2P order to ${order.side === 'buy' ? 'buy' : 'sell'} ${cryptoAmount} ${offer.asset}. Complete payment within ${offer.paymentWindowMinutes} minutes.`,
+        data: {
+          orderId: order._id,
+          reference: order.reference,
+          amount: cryptoAmount,
+          currency: offer.asset
+        },
+        sendEmail: true
+      });
+
       res.status(201).json({
+        success: true,
         message: 'P2P order created and crypto locked in escrow',
         order: toOrderPayload(order, req.userId)
       });
-    } catch (error) {
-      res.status(500).json({ message: error.message || 'Server error' });
-    }
-  }
+    });
+  })
 );
 
 router.get('/orders', authMiddleware, async (req, res) => {
@@ -470,29 +514,50 @@ router.post(
   '/orders/:orderId/confirm-payment',
   authMiddleware,
   [param('orderId').isMongoId(), body('releaseNote').optional().isString()],
-  async (req, res) => {
-    try {
-      if (!hasValidRequest(req, res)) return;
+  asyncHandler(async (req, res) => {
+    const logger = new Logger('p2p/confirm-payment');
+    
+    if (!hasValidRequest(req, res)) return;
 
-      const order = await getOrderForUser(req.params.orderId, req.userId);
-      if (!order) {
-        return res.status(404).json({ message: 'Order not found' });
-      }
-      if (String(order.seller.userId) !== String(req.userId)) {
-        return res.status(403).json({ message: 'Only the seller can release escrow' });
-      }
-      if (!['payment_sent', 'awaiting_payment'].includes(order.status)) {
-        return res.status(400).json({ message: 'This order cannot be released' });
-      }
+    const order = await getOrderForUser(req.params.orderId, req.userId);
+    if (!order) {
+      throw new AppError('Order not found', 404);
+    }
 
-      const [seller, buyer] = await Promise.all([User.findById(order.seller.userId), User.findById(order.buyer.userId)]);
+    if (String(order.seller.userId) !== String(req.userId)) {
+      throw new AppError('Only the seller can release escrow', 403);
+    }
+
+    // FIX: Check if order has expired
+    if (order.expiresAt && new Date() > order.expiresAt) {
+      throw new AppError('This order has expired. Please cancel and create a new one.', 400);
+    }
+
+    if (!['payment_sent', 'awaiting_payment'].includes(order.status)) {
+      throw new AppError('This order cannot be released', 400);
+    }
+
+    // FIX: Require payment confirmation from buyer first if still awaiting payment
+    if (order.status === 'awaiting_payment') {
+      throw new AppError('Buyer has not marked payment as sent yet', 400);
+    }
+
+    return withTransaction(async (session) => {
+      const [seller, buyer] = await Promise.all([
+        User.findById(order.seller.userId),
+        User.findById(order.buyer.userId)
+      ]);
+
+      // Apply fees and release crypto
       await applyP2PFeesAndRelease({ order, seller, buyer });
 
+      // Update order status within transaction
       order.status = 'completed';
       order.releaseNote = req.body.releaseNote || null;
       order.releasedAt = new Date();
       order.updatedAt = new Date();
 
+      // Create transactions for record keeping
       const sellerTx = new Transaction({
         userId: seller._id,
         type: 'p2p_sell',
@@ -519,36 +584,87 @@ router.post(
         metadata: { p2pOrderId: order._id, fiatAmount: order.fiatAmount, price: order.price }
       });
 
-      await Promise.all([seller.save(), buyer.save(), order.save(), sellerTx.save(), buyerTx.save()]);
-      res.json({ message: 'Escrow released successfully', order: toOrderPayload(order, req.userId) });
-    } catch (error) {
-      res.status(500).json({ message: error.message || 'Server error' });
-    }
-  }
+      await Promise.all([
+        seller.save({ session }),
+        buyer.save({ session }),
+        order.save({ session }),
+        sellerTx.save({ session }),
+        buyerTx.save({ session })
+      ]);
+
+      logger.info(`P2P order completed: ${order.reference}, seller: ${seller._id}, buyer: ${buyer._id}`);
+
+      // Send notifications
+      await Promise.all([
+        createNotification({
+          user: seller,
+          type: 'send',
+          title: 'P2P sale completed',
+          body: `You successfully sold ${order.cryptoAmount} ${order.asset} to ${order.buyer.username}`,
+          data: {
+            orderId: order._id,
+            reference: order.reference,
+            amount: order.cryptoAmount,
+            feeAmount: order.cryptoFeeAmount
+          },
+          sendEmail: true
+        }),
+        createNotification({
+          user: buyer,
+          type: 'receive',
+          title: 'P2P purchase completed',
+          body: `Your purchase of ${order.cryptoAmount} ${order.asset} has been completed. Crypto is now available in your wallet.`,
+          data: {
+            orderId: order._id,
+            reference: order.reference,
+            amount: order.cryptoAmount
+          },
+          sendEmail: true
+        })
+      ]);
+
+      res.json({
+        success: true,
+        message: 'Escrow released successfully',
+        order: toOrderPayload(order, req.userId)
+      });
+    });
+  })
 );
 
 router.post(
   '/orders/:orderId/cancel',
   authMiddleware,
   [param('orderId').isMongoId(), body('reason').optional().isString()],
-  async (req, res) => {
-    try {
-      if (!hasValidRequest(req, res)) return;
+  asyncHandler(async (req, res) => {
+    const logger = new Logger('p2p/cancel-order');
+    
+    if (!hasValidRequest(req, res)) return;
 
-      const order = await getOrderForUser(req.params.orderId, req.userId);
-      if (!order) {
-        return res.status(404).json({ message: 'Order not found' });
-      }
-      if (!['awaiting_payment', 'payment_sent'].includes(order.status)) {
-        return res.status(400).json({ message: 'This order cannot be cancelled' });
-      }
-      if (order.status === 'payment_sent' && String(order.seller.userId) !== String(req.userId)) {
-        return res.status(400).json({ message: 'Seller must review or dispute after payment is marked sent' });
-      }
+    const order = await getOrderForUser(req.params.orderId, req.userId);
+    if (!order) {
+      throw new AppError('Order not found', 404);
+    }
 
-      const [offer, seller] = await Promise.all([P2POffer.findById(order.offerId), User.findById(order.seller.userId)]);
+    if (!['awaiting_payment', 'payment_sent'].includes(order.status)) {
+      throw new AppError('This order cannot be cancelled', 400);
+    }
+
+    // FIX: Only seller can cancel if payment_sent (payment confirmation was made)
+    if (order.status === 'payment_sent' && String(order.seller.userId) !== String(req.userId)) {
+      throw new AppError('Seller must review or dispute after payment is marked sent', 400);
+    }
+
+    return withTransaction(async (session) => {
+      const [offer, seller] = await Promise.all([
+        P2POffer.findById(order.offerId),
+        User.findById(order.seller.userId)
+      ]);
+
+      // Unlock funds
       unlockFunds(seller, order.asset, order.cryptoAmount);
 
+      // Restore offer availability if not cancelled
       if (offer && offer.status !== 'cancelled') {
         offer.availableAmount = Number(offer.availableAmount) + Number(order.cryptoAmount);
         if (offer.status === 'completed') {
@@ -562,15 +678,38 @@ router.post(
       order.cancelReason = req.body.reason || null;
       order.updatedAt = new Date();
 
-      const saves = [seller.save(), order.save()];
-      if (offer) saves.push(offer.save());
-      await Promise.all(saves);
+      await Promise.all([
+        seller.save({ session }),
+        order.save({ session }),
+        ...(offer ? [offer.save({ session })] : [])
+      ]);
 
-      res.json({ message: 'Order cancelled and escrow returned', order: toOrderPayload(order, req.userId) });
-    } catch (error) {
-      res.status(500).json({ message: error.message || 'Server error' });
-    }
-  }
+      logger.info(`P2P order cancelled: ${order.reference}, reason: ${req.body.reason || 'unspecified'}`);
+
+      // Send notification to other party
+      const otherUserId = String(order.buyer.userId) === String(req.userId) ? order.seller.userId : order.buyer.userId;
+      const otherUser = await User.findById(otherUserId);
+      if (otherUser) {
+        await createNotification({
+          user: otherUser,
+          type: 'alert',
+          title: 'P2P order cancelled',
+          body: `The P2P order for ${order.cryptoAmount} ${order.asset} has been cancelled.`,
+          data: {
+            orderId: order._id,
+            reference: order.reference
+          },
+          sendEmail: true
+        });
+      }
+
+      res.json({
+        success: true,
+        message: 'Order cancelled and escrow returned',
+        order: toOrderPayload(order, req.userId)
+      });
+    });
+  })
 );
 
 router.post(
@@ -763,5 +902,10 @@ router.post(
     }
   }
 );
+
+// Global error handler for P2P routes
+router.use((err, req, res, next) => {
+  handleError(err, req, res, new Logger('p2p'));
+});
 
 module.exports = router;

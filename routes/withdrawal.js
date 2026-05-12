@@ -8,6 +8,10 @@ const monnifyService = require('../services/monnify');
 const flutterwaveService = require('../services/flutterwave');
 const { createNotification } = require('../services/notifications');
 const { requireVerifiedKycForTransactions } = require('../middleware/kyc');
+const { AppError, handleError, asyncHandler } = require('../utils/errorHandler');
+const { withTransaction } = require('../utils/database');
+const { storeOTP, sendOTPEmail, verifyOTP, requires2FA } = require('../utils/twoFA');
+const Logger = require('../utils/logger');
 
 const BANKS = [
   { id: '044', name: 'Access Bank', code: '044' },
@@ -63,173 +67,336 @@ router.post('/verify-account', authMiddleware, [
   }
 });
 
-// NGN Withdrawal
+// NGN Withdrawal - Request OTP
+router.post('/ngn/request-otp', authMiddleware, requireVerifiedKycForTransactions, [
+  body('amount').isFloat({ min: 500 })
+], asyncHandler(async (req, res) => {
+  const logger = new Logger('withdrawal/ngn/request-otp');
+  
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) {
+    return res.status(400).json({ errors: errors.array() });
+  }
+
+  const { amount } = req.body;
+  const user = await User.findById(req.userId);
+
+  if (user.balances.NGN < amount) {
+    throw new AppError('Insufficient balance', 400);
+  }
+
+  if (!requires2FA(user, amount)) {
+    // No 2FA required, return success
+    return res.json({ requiresOTP: false });
+  }
+
+  // Generate and send OTP
+  const otp = await storeOTP(user, 'withdrawal');
+  await sendOTPEmail(user, otp, 'withdrawal');
+
+  logger.info(`OTP sent for NGN withdrawal of ${amount}`);
+  res.json({
+    requiresOTP: true,
+    message: 'OTP sent to your email'
+  });
+}));
+
+// NGN Withdrawal - Confirm with OTP and initiate transfer
 router.post('/ngn', authMiddleware, requireVerifiedKycForTransactions, [
   body('amount').isFloat({ min: 500 }),
-  body('bankCode').notEmpty(),
-  body('accountNumber').isLength({ min: 10, max: 10 }),
-  body('accountName').notEmpty(),
-  body('pin').isLength({ min: 4, max: 6 })
-], async (req, res) => {
-  try {
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) {
-      return res.status(400).json({ errors: errors.array() });
+  body('bankCode').notEmpty().withMessage('Bank code required'),
+  body('accountNumber').isLength({ min: 10, max: 10 }).withMessage('Invalid account number'),
+  body('accountName').notEmpty().withMessage('Account name required'),
+  body('pin').isLength({ min: 4, max: 6 }).withMessage('Invalid PIN'),
+  body('otp').optional().isString()
+], asyncHandler(async (req, res) => {
+  const logger = new Logger('withdrawal/ngn');
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) {
+    return res.status(400).json({ errors: errors.array() });
+  }
+
+  const { amount, bankCode, accountNumber, accountName, pin, otp } = req.body;
+  const user = await User.findById(req.userId);
+
+  // Verify PIN
+  const pinMatch = await user.comparePin(pin);
+  if (!pinMatch) {
+    throw new AppError('Invalid PIN', 400);
+  }
+
+  // Check balance (before checking OTP, so frontend can decide)
+  if (user.balances.NGN < amount) {
+    throw new AppError('Insufficient balance', 400);
+  }
+
+  // Verify 2FA if required
+  if (requires2FA(user, amount)) {
+    if (!otp) {
+      return res.status(202).json({
+        success: false,
+        message: '2FA verification required',
+        requiresOTP: true
+      });
     }
+    
+    await verifyOTP(user, otp, 'withdrawal');
+    user = await User.findById(req.userId); // Refresh user after OTP verification
+  }
 
-    const { amount, bankCode, accountNumber, accountName, pin } = req.body;
-    const user = await User.findById(req.userId);
+  const fee = amount < 10000 ? 50 : 0;
+  const reference = `WD-NGN-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
 
-    const pinMatch = await user.comparePin(pin);
-    if (!pinMatch) {
-      return res.status(400).json({ message: 'Invalid PIN' });
-    }
+  // Use transaction to ensure atomicity
+  return withTransaction(async (session) => {
+    const bankData = {
+      bankCode,
+      accountNumber,
+      accountName,
+      bankName: BANKS.find(b => b.code === bankCode)?.name || 'Unknown'
+    };
 
-    if (user.balances.NGN < amount) {
-      return res.status(400).json({ message: 'Insufficient balance' });
-    }
-
-    const fee = amount < 10000 ? 50 : 0;
-    const reference = `WD-NGN-${Date.now()}`;
-
-    // Try Monnify first, then Flutterwave, fallback to mock
+    // Try to initiate transfer with bank partner
     let transferResult = null;
+    let transferInitiated = false;
 
     if (monnifyService.isConfigured) {
-      transferResult = await monnifyService.initiateTransfer({
-        amount: amount - fee,
-        accountNumber,
-        bankCode,
-        accountName,
-        narration: 'FlameX Withdrawal',
-        reference
-      });
+      try {
+        transferResult = await monnifyService.initiateTransfer({
+          amount: amount - fee,
+          accountNumber,
+          bankCode,
+          accountName,
+          narration: 'FlameX Withdrawal',
+          reference
+        });
+        transferInitiated = transferResult?.success === true;
+      } catch (transferError) {
+        logger.error(`Monnify transfer failed: ${transferError.message}`);
+        throw new AppError('Bank transfer failed. Please try again.', 503, transferError.message);
+      }
     } else if (flutterwaveService.isConfigured) {
-      transferResult = await flutterwaveService.initiateTransfer({
-        amount: amount - fee,
-        accountNumber,
-        bankCode,
-        accountName,
-        narration: 'FlameX Withdrawal',
-        reference
-      });
+      try {
+        transferResult = await flutterwaveService.initiateTransfer({
+          amount: amount - fee,
+          accountNumber,
+          bankCode,
+          accountName,
+          narration: 'FlameX Withdrawal',
+          reference
+        });
+        transferInitiated = transferResult?.success === true;
+      } catch (transferError) {
+        logger.error(`Flutterwave transfer failed: ${transferError.message}`);
+        throw new AppError('Bank transfer failed. Please try again.', 503, transferError.message);
+      }
+    } else {
+      throw new AppError('Bank transfer service not configured', 503);
     }
 
+    // Only deduct balance after successful bank transfer initiation
+    if (!transferInitiated) {
+      throw new AppError('Failed to initiate bank transfer', 503);
+    }
+
+    // Create transaction record
     const transaction = new Transaction({
       userId: req.userId,
       type: 'withdrawal',
       amount,
       currency: 'NGN',
-      description: `Withdrawal to ${accountName}`,
-      status: transferResult?.success ? 'pending' : 'pending',
+      description: `Withdrawal to ${accountName} (${bankData.bankName})`,
+      status: 'pending',
       fee,
       reference,
-      metadata: { transferResult, bankCode, accountNumber }
+      metadata: {
+        bankData,
+        transferReference: transferResult?.reference || transferResult?.transactionId,
+        provider: monnifyService.isConfigured ? 'monnify' : 'flutterwave'
+      }
     });
-    await transaction.save();
+    await transaction.save({ session });
 
+    // Deduct balance (atomically within transaction)
     user.balances.NGN -= amount;
-    await user.save();
+    await user.save({ session });
 
+    // Send notification
     await createNotification({
       user,
       type: 'send',
       title: 'NGN withdrawal initiated',
-      body: `Your withdrawal of ${amount} NGN to ${accountName} has been initiated.`,
+      body: `Your withdrawal of ₦${amount.toLocaleString()} to ${accountName} has been initiated.`,
       data: {
         reference,
         amount,
         fee,
         currency: 'NGN',
         transactionId: transaction._id,
-        accountNumber,
-        bankCode
+        status: 'pending'
       },
-      sendEmail: true,
-      emailAmount: amount,
-      emailCurrency: 'NGN',
-      emailReference: reference
+      sendEmail: true
     });
 
+    logger.info(`NGN withdrawal initiated: ${reference}, amount: ${amount}`);
+
     res.json({
-      message: 'Withdrawal initiated',
+      success: true,
+      message: 'Withdrawal initiated successfully',
       reference,
       amount: amount - fee,
       fee,
       newBalance: user.balances.NGN,
-      transferStatus: transferResult?.success ? 'processing' : 'pending'
+      transactionId: transaction._id
     });
-  } catch (error) {
-    res.status(500).json({ message: 'Server error' });
-  }
-});
+  });
+}));
 
-// Crypto Withdrawal
+// Crypto Withdrawal - Request OTP
+router.post('/crypto/request-otp', authMiddleware, requireVerifiedKycForTransactions, [
+  body('amount').isFloat({ min: 0.000001 })
+], asyncHandler(async (req, res) => {
+  const logger = new Logger('withdrawal/crypto/request-otp');
+  
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) {
+    return res.status(400).json({ errors: errors.array() });
+  }
+
+  const { amount } = req.body;
+  const user = await User.findById(req.userId);
+
+  // For crypto, always require 2FA if large amount
+  if (!requires2FA(user, amount)) {
+    return res.json({ requiresOTP: false });
+  }
+
+  const otp = await storeOTP(user, 'withdrawal');
+  await sendOTPEmail(user, otp, 'withdrawal');
+
+  logger.info(`OTP sent for crypto withdrawal of ${amount}`);
+  res.json({
+    requiresOTP: true,
+    message: 'OTP sent to your email'
+  });
+}));
+
+// Crypto Withdrawal - Confirm and execute
 router.post('/crypto', authMiddleware, requireVerifiedKycForTransactions, [
-  body('chainId').notEmpty(),
-  body('token').notEmpty(),
-  body('amount').isFloat({ min: 0 }),
-  body('toAddress').notEmpty(),
-  body('pin').isLength({ min: 4, max: 6 })
-], async (req, res) => {
-  try {
-    const { chainId, token, amount, toAddress, pin } = req.body;
-    const user = await User.findById(req.userId);
-
-    const pinMatch = await user.comparePin(pin);
-    if (!pinMatch) {
-      return res.status(400).json({ message: 'Invalid PIN' });
-    }
-
-    const balance = user.balances[token.toUpperCase()] || 0;
-    if (balance < amount) {
-      return res.status(400).json({ message: 'Insufficient balance' });
-    }
-
-    const reference = `WD-CRP-${Date.now()}`;
-
-    const transaction = new Transaction({
-      userId: req.userId,
-      type: 'withdrawal',
-      amount,
-      currency: token.toUpperCase(),
-      chainId,
-      description: `${token} withdrawal`,
-      status: 'pending',
-      reference
-    });
-    await transaction.save();
-
-    user.balances[token.toUpperCase()] -= amount;
-    await user.save();
-
-    await createNotification({
-      user,
-      type: 'send',
-      title: 'Crypto withdrawal initiated',
-      body: `Your ${token.toUpperCase()} withdrawal to ${toAddress} has been initiated.`,
-      data: {
-        reference,
-        amount,
-        currency: token.toUpperCase(),
-        transactionId: transaction._id,
-        chainId,
-        toAddress
-      },
-      sendEmail: true,
-      emailAmount: amount,
-      emailCurrency: token.toUpperCase(),
-      emailReference: reference
-    });
-
-    res.json({
-      message: 'Withdrawal initiated',
-      reference,
-      newBalance: user.balances[token.toUpperCase()]
-    });
-  } catch (error) {
-    res.status(500).json({ message: 'Server error' });
+  body('chainId').notEmpty().withMessage('Chain ID required'),
+  body('token').notEmpty().withMessage('Token required'),
+  body('amount').isFloat({ min: 0.000001 }).withMessage('Invalid amount'),
+  body('toAddress').matches(/^0x[a-fA-F0-9]{40}$|^[1-9A-HJ-NP-Z]{32,44}$/).withMessage('Invalid recipient address'),
+  body('pin').isLength({ min: 4, max: 6 }).withMessage('Invalid PIN'),
+  body('gasFeeEstimate').optional().isFloat({ min: 0 }).withMessage('Invalid gas fee'),
+  body('otp').optional().isString()
+], asyncHandler(async (req, res) => {
+  const logger = new Logger('withdrawal/crypto');
+  
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) {
+    return res.status(400).json({ errors: errors.array() });
   }
+
+  const { chainId, token, amount, toAddress, pin, gasFeeEstimate = 0, otp } = req.body;
+  const tokenUpper = token.toUpperCase();
+  
+  let user = await User.findById(req.userId);
+
+  // Verify PIN
+  const pinMatch = await user.comparePin(pin);
+  if (!pinMatch) {
+    throw new AppError('Invalid PIN', 400);
+  }
+
+  // Validate balance including gas fee
+  const totalAmount = amount + gasFeeEstimate;
+  const balance = user.balances[tokenUpper] || 0;
+  if (balance < totalAmount) {
+    throw new AppError(`Insufficient ${tokenUpper} balance. Required: ${totalAmount}, Available: ${balance}`, 400);
+  }
+
+  // Check for locked balances (P2P escrow)
+  const lockedAmount = user.lockedBalances?.[tokenUpper] || 0;
+  const availableAfterLock = balance - lockedAmount;
+  if (availableAfterLock < totalAmount) {
+    throw new AppError(`Insufficient available ${tokenUpper} balance. Available: ${availableAfterLock}, Required: ${totalAmount}`, 400);
+  }
+
+  // Verify 2FA if required
+  if (requires2FA(user, amount)) {
+    if (!otp) {
+      return res.status(202).json({
+        success: false,
+        message: '2FA verification required',
+        requiresOTP: true
+      });
+    }
+    
+    await verifyOTP(user, otp, 'withdrawal');
+    user = await User.findById(req.userId);
+  }
+
+  const reference = `WD-CRP-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+
+  // Create transaction with gas fee tracking
+  const transaction = new Transaction({
+    userId: req.userId,
+    type: 'withdrawal',
+    amount,
+    currency: tokenUpper,
+    chainId,
+    description: `${tokenUpper} withdrawal to ${toAddress.substring(0, 10)}...`,
+    status: 'pending',
+    gasFee: gasFeeEstimate,
+    reference,
+    metadata: {
+      toAddress,
+      chainId,
+      gasFeeEstimate
+    }
+  });
+  await transaction.save();
+
+  // Deduct balance and gas fee
+  user.balances[tokenUpper] -= (amount + gasFeeEstimate);
+  await user.save();
+
+  // Send notification
+  await createNotification({
+    user,
+    type: 'send',
+    title: 'Crypto withdrawal initiated',
+    body: `Your ${tokenUpper} withdrawal of ${amount} to ${toAddress.substring(0, 10)}... has been initiated.${gasFeeEstimate > 0 ? ` Network fee: ${gasFeeEstimate}` : ''}`,
+    data: {
+      reference,
+      amount,
+      currency: tokenUpper,
+      gasFee: gasFeeEstimate,
+      chainId,
+      toAddress,
+      transactionId: transaction._id,
+      status: 'pending'
+    },
+    sendEmail: true
+  });
+
+  logger.info(`Crypto withdrawal initiated: ${reference}, amount: ${amount}, gas: ${gasFeeEstimate}`);
+
+  res.json({
+    success: true,
+    message: 'Withdrawal initiated successfully',
+    reference,
+    amount,
+    gasFee: gasFeeEstimate,
+    newBalance: user.balances[tokenUpper],
+    transactionId: transaction._id
+  });
+}));
+
+// Global error handler for this router
+router.use((err, req, res, next) => {
+  handleError(err, req, res, new Logger('withdrawal'));
 });
 
 module.exports = router;

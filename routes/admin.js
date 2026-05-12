@@ -7,11 +7,16 @@ const Transaction = require('../models/Transaction');
 const PlatformLedger = require('../models/PlatformLedger');
 const AuditLog = require('../models/AuditLog');
 const P2POrder = require('../models/P2POrder');
+const P2PDispute = require('../models/P2PDispute');
+const GiftCardTrade = require('../models/GiftCardTrade');
+const Notification = require('../models/Notification');
 const monnifyService = require('../services/monnify');
 const flutterwaveService = require('../services/flutterwave');
 const { getPlatformSettings, savePlatformSettings } = require('../utils/admin');
 const { getTreasuryBalances, getTreasurySummary, createLedgerEntry } = require('../services/platformLedger');
 const { logAuditEvent } = require('../services/audit');
+const { getGiftCardConfig, saveGiftCardConfig } = require('../utils/giftcards');
+const { createNotification } = require('../services/notifications');
 
 const router = express.Router();
 
@@ -46,6 +51,59 @@ function mapUser(user) {
     status: user.status,
     username: user.username,
     emailVerified: user.emailVerified
+  };
+}
+
+function mapKycSubmission(user) {
+  return {
+    _id: user._id,
+    userId: user._id,
+    user: mapUser(user),
+    status: user.kycVerified ? 'approved' : user.kycLevel > 0 ? 'pending' : 'rejected',
+    tier: user.kycLevel || 0,
+    bvn: user.bvn,
+    nin: user.nin,
+    submittedAt: user.updatedAt || user.createdAt,
+    reviewedAt: user.kycVerified ? user.updatedAt : null,
+    rejectionReason: user.kycVerified ? null : user.kycLevel > 0 ? null : 'KYC not yet verified'
+  };
+}
+
+function mapVirtualCard(user) {
+  if (!user.virtualCard?.id) return null;
+  return {
+    _id: user.virtualCard.id,
+    userId: user._id,
+    user: mapUser(user),
+    cardNumber: user.virtualCard.cardNumber,
+    last4: user.virtualCard.cardNumber ? user.virtualCard.cardNumber.slice(-4) : null,
+    expiryMonth: user.virtualCard.expiryMonth,
+    expiryYear: user.virtualCard.expiryYear,
+    cardholderName: `${user.firstName || ''} ${user.lastName || ''}`.trim(),
+    status: user.virtualCard.status || 'inactive',
+    type: 'visa',
+    balance: Number(user.virtualCard.balance || 0),
+    currency: 'USD',
+    color: user.virtualCard.color || 'purple',
+    createdAt: user.updatedAt || user.createdAt
+  };
+}
+
+function mapBillPayment(transaction) {
+  const metadata = transaction.metadata?.toObject ? transaction.metadata.toObject() : transaction.metadata || {};
+  return {
+    _id: transaction._id,
+    userId: transaction.userId,
+    type: transaction.type,
+    provider: metadata.provider || metadata.billProvider || '-',
+    customerId: metadata.customerId || metadata.phoneNumber || metadata.smartCardNumber || metadata.meterNumber || '-',
+    amount: transaction.amount,
+    currency: transaction.currency,
+    status: transaction.status,
+    transactionRef: transaction.reference,
+    description: transaction.description,
+    createdAt: transaction.createdAt,
+    updatedAt: transaction.updatedAt
   };
 }
 
@@ -120,6 +178,61 @@ router.get('/users/:id', [param('id').isMongoId()], async (req, res) => {
     res.status(500).json({ message: 'Server error' });
   }
 });
+
+router.get('/users/:id/transactions', [param('id').isMongoId()], async (req, res) => {
+  try {
+    if (!sendValidation(req, res)) return;
+    const transactions = await Transaction.find({ userId: req.params.id }).sort({ createdAt: -1 }).limit(200);
+    res.json({ transactions });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+router.get('/users/:id/notifications', [param('id').isMongoId()], async (req, res) => {
+  try {
+    if (!sendValidation(req, res)) return;
+    const notifications = await Notification.find({ userId: req.params.id }).sort({ createdAt: -1 }).limit(100);
+    res.json({ notifications });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+router.post(
+  '/users/:id/notify',
+  [param('id').isMongoId(), body('title').isLength({ min: 3 }), body('body').isLength({ min: 3 })],
+  async (req, res) => {
+    try {
+      if (!sendValidation(req, res)) return;
+      const user = await User.findById(req.params.id);
+      if (!user) {
+        return res.status(404).json({ message: 'User not found' });
+      }
+
+      const notification = await createNotification({
+        user,
+        type: req.body.type || 'system',
+        title: req.body.title,
+        body: req.body.body,
+        data: req.body.data || {},
+        sendEmail: Boolean(req.body.sendEmail)
+      });
+
+      await logAuditEvent(req, {
+        action: 'admin_send_user_notification',
+        entityType: 'notification',
+        entityId: notification?._id,
+        severity: 'warning',
+        metadata: { userId: user._id, title: req.body.title }
+      });
+
+      res.status(201).json({ message: 'Notification sent', notification });
+    } catch (error) {
+      res.status(500).json({ message: 'Server error' });
+    }
+  }
+);
 
 router.post('/users/:id/suspend', [param('id').isMongoId(), body('reason').optional().isString()], async (req, res) => {
   try {
@@ -251,6 +364,250 @@ router.put('/transactions/:id', [param('id').isMongoId(), body('status').isIn(['
       metadata: { status: req.body.status, note: req.body.note || null }
     });
     res.json({ message: 'Transaction updated', transaction });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+router.get('/kyc', async (req, res) => {
+  try {
+    const status = String(req.query.status || '').trim();
+    const query = { kycLevel: { $gt: 0 } };
+
+    if (status === 'pending') {
+      query.kycVerified = false;
+    } else if (status === 'approved') {
+      query.kycVerified = true;
+    } else if (status === 'rejected') {
+      query.kycLevel = 0;
+      query.kycVerified = false;
+    }
+
+    const users = await User.find(query).sort({ updatedAt: -1 }).limit(200);
+    res.json({ submissions: users.map(mapKycSubmission) });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+router.get('/kyc/stats', async (req, res) => {
+  try {
+    const [pending, approved, total] = await Promise.all([
+      User.countDocuments({ kycVerified: false, kycLevel: { $gt: 0 } }),
+      User.countDocuments({ kycVerified: true }),
+      User.countDocuments({ $or: [{ kycVerified: true }, { kycLevel: { $gt: 0 } }] })
+    ]);
+    res.json({ pending, approved, rejected: Math.max(total - pending - approved, 0), total });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+router.get('/kyc/:id', [param('id').isMongoId()], async (req, res) => {
+  try {
+    if (!sendValidation(req, res)) return;
+    const user = await User.findById(req.params.id);
+    if (!user) {
+      return res.status(404).json({ message: 'KYC submission not found' });
+    }
+    res.json({ submission: mapKycSubmission(user) });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+router.post('/kyc/:id/approve', [param('id').isMongoId(), body('tier').isInt({ min: 1, max: 3 })], async (req, res) => {
+  try {
+    if (!sendValidation(req, res)) return;
+    const user = await User.findById(req.params.id);
+    if (!user) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+
+    user.kycVerified = true;
+    user.kycLevel = Number(req.body.tier);
+    await user.save();
+
+    await createNotification({
+      user,
+      type: 'security',
+      title: 'KYC approved',
+      body: `Your KYC has been approved for Tier ${req.body.tier}.`,
+      sendEmail: true
+    });
+
+    await logAuditEvent(req, {
+      action: 'admin_approve_kyc',
+      entityType: 'user',
+      entityId: user._id,
+      severity: 'warning',
+      metadata: { tier: req.body.tier }
+    });
+
+    res.json({ message: 'KYC approved', submission: mapKycSubmission(user) });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+router.post('/kyc/:id/reject', [param('id').isMongoId(), body('reason').isLength({ min: 3 })], async (req, res) => {
+  try {
+    if (!sendValidation(req, res)) return;
+    const user = await User.findById(req.params.id);
+    if (!user) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+
+    user.kycVerified = false;
+    user.kycLevel = 0;
+    await user.save();
+
+    await createNotification({
+      user,
+      type: 'security',
+      title: 'KYC rejected',
+      body: `Your KYC review was rejected. Reason: ${req.body.reason}`,
+      sendEmail: true
+    });
+
+    await logAuditEvent(req, {
+      action: 'admin_reject_kyc',
+      entityType: 'user',
+      entityId: user._id,
+      severity: 'warning',
+      metadata: { reason: req.body.reason }
+    });
+
+    res.json({
+      message: 'KYC rejected',
+      submission: { ...mapKycSubmission(user), status: 'rejected', rejectionReason: req.body.reason }
+    });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+router.get('/bill-payments', async (req, res) => {
+  try {
+    const type = String(req.query.type || '').trim();
+    const filter = {
+      type: { $in: ['airtime', 'data', 'electricity', 'cable', 'betting', 'giftcard', 'bill_payment'] }
+    };
+    if (type) {
+      filter.type = type;
+    }
+    const transactions = await Transaction.find(filter).sort({ createdAt: -1 }).limit(200);
+    res.json({ billPayments: transactions.map(mapBillPayment) });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+router.get('/bill-payments/stats', async (req, res) => {
+  try {
+    const transactions = await Transaction.find({
+      type: { $in: ['airtime', 'data', 'electricity', 'cable', 'betting', 'giftcard', 'bill_payment'] }
+    }).limit(500);
+    const totalVolume = transactions
+      .filter((item) => item.status === 'completed')
+      .reduce((sum, item) => sum + Number(item.amount || 0), 0);
+    res.json({
+      total: transactions.length,
+      completed: transactions.filter((item) => item.status === 'completed').length,
+      failed: transactions.filter((item) => item.status === 'failed').length,
+      pending: transactions.filter((item) => item.status === 'pending').length,
+      totalVolume
+    });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+router.get('/virtual-cards', async (req, res) => {
+  try {
+    const users = await User.find({ 'virtualCard.id': { $ne: null } }).sort({ updatedAt: -1 }).limit(200);
+    res.json({ cards: users.map(mapVirtualCard).filter(Boolean) });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+router.put('/virtual-cards/:id/status', [param('id').isString(), body('status').isIn(['active', 'frozen', 'blocked', 'cancelled'])], async (req, res) => {
+  try {
+    if (!sendValidation(req, res)) return;
+    const user = await User.findOne({ 'virtualCard.id': req.params.id });
+    if (!user) {
+      return res.status(404).json({ message: 'Virtual card not found' });
+    }
+
+    user.virtualCard.status = req.body.status;
+    await user.save();
+
+    await logAuditEvent(req, {
+      action: 'admin_update_virtual_card_status',
+      entityType: 'virtual_card',
+      entityId: req.params.id,
+      severity: 'warning',
+      metadata: { status: req.body.status }
+    });
+
+    res.json({ message: 'Virtual card updated', card: mapVirtualCard(user) });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+router.get('/p2p/disputes', async (req, res) => {
+  try {
+    const status = String(req.query.status || '').trim();
+    const query = {};
+    if (status) query.status = status;
+    const disputes = await P2PDispute.find(query).sort({ createdAt: -1 }).limit(100);
+    res.json({ disputes });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+router.post('/p2p/disputes/:id/resolve', [
+  param('id').isMongoId(),
+  body('outcome').isIn(['release_to_buyer', 'refund_to_seller', 'dismissed']),
+  body('note').optional().isString()
+], async (req, res) => {
+  try {
+    if (!sendValidation(req, res)) return;
+    const dispute = await P2PDispute.findById(req.params.id);
+    if (!dispute) {
+      return res.status(404).json({ message: 'Dispute not found' });
+    }
+
+    dispute.status = req.body.outcome === 'dismissed' ? 'dismissed' : 'resolved';
+    dispute.resolution = {
+      outcome: req.body.outcome,
+      note: req.body.note || null,
+      resolvedByUserId: req.userId,
+      resolvedAt: new Date()
+    };
+    await dispute.save();
+
+    await logAuditEvent(req, {
+      action: 'admin_resolve_p2p_dispute',
+      entityType: 'p2p_dispute',
+      entityId: dispute._id,
+      severity: 'critical',
+      metadata: { outcome: req.body.outcome, note: req.body.note || null }
+    });
+
+    res.json({ message: 'Dispute updated', dispute });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+router.get('/notifications', async (req, res) => {
+  try {
+    const notifications = await Notification.find().sort({ createdAt: -1 }).limit(200);
+    res.json({ notifications });
   } catch (error) {
     res.status(500).json({ message: 'Server error' });
   }
@@ -529,6 +886,192 @@ router.get('/audit-logs', async (req, res) => {
   try {
     const logs = await AuditLog.find().sort({ createdAt: -1 }).limit(200);
     res.json({ logs });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+router.get('/giftcard-rates', async (req, res) => {
+  try {
+    const config = await getGiftCardConfig();
+    res.json(config);
+  } catch (error) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+router.put('/giftcard-rates', async (req, res) => {
+  try {
+    const config = await saveGiftCardConfig(req.body || {}, req.userId);
+    await logAuditEvent(req, {
+      action: 'admin_update_giftcard_rates',
+      entityType: 'giftcard_rate',
+      entityId: 'giftcard_trade_config',
+      severity: 'warning',
+      metadata: req.body || {}
+    });
+    res.json({ message: 'Gift card rates updated', config });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+router.get('/giftcard-trades', async (req, res) => {
+  try {
+    const status = String(req.query.status || '').trim();
+    const query = {};
+    if (status) query.status = status;
+    const trades = await GiftCardTrade.find(query).sort({ createdAt: -1 }).limit(200);
+    res.json({ trades });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+router.post('/giftcard-trades/:id/request-info', [param('id').isMongoId(), body('note').isLength({ min: 3 })], async (req, res) => {
+  try {
+    if (!sendValidation(req, res)) return;
+    const trade = await GiftCardTrade.findById(req.params.id);
+    if (!trade) {
+      return res.status(404).json({ message: 'Gift card trade not found' });
+    }
+    trade.status = 'more_info_required';
+    trade.reviewNote = req.body.note;
+    trade.reviewedByUserId = req.userId;
+    trade.reviewedAt = new Date();
+    await trade.save();
+
+    const user = await User.findById(trade.userId);
+    if (user) {
+      await createNotification({
+        user,
+        type: 'system',
+        title: 'More information needed',
+        body: `Your gift card trade ${trade.reference} needs more information from you.`,
+        data: { giftCardTradeId: trade._id, reference: trade.reference },
+        sendEmail: true
+      });
+    }
+
+    await logAuditEvent(req, {
+      action: 'admin_request_giftcard_info',
+      entityType: 'giftcard_trade',
+      entityId: trade._id,
+      severity: 'warning',
+      metadata: { note: req.body.note }
+    });
+    res.json({ message: 'Gift card trade marked for more info', trade });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+router.post('/giftcard-trades/:id/approve', [param('id').isMongoId(), body('finalPayout').optional().isFloat({ min: 0 }), body('note').optional().isString()], async (req, res) => {
+  try {
+    if (!sendValidation(req, res)) return;
+    const trade = await GiftCardTrade.findById(req.params.id);
+    if (!trade) {
+      return res.status(404).json({ message: 'Gift card trade not found' });
+    }
+    if (!['pending_review', 'more_info_required'].includes(trade.status)) {
+      return res.status(400).json({ message: 'This trade has already been processed' });
+    }
+
+    const user = await User.findById(trade.userId);
+    if (!user) {
+      return res.status(404).json({ message: 'Trade owner not found' });
+    }
+
+    const finalPayout = Number(req.body.finalPayout ?? trade.estimatedPayout);
+    user.balances.NGN = Number(user.balances.NGN || 0) + finalPayout;
+
+    const transaction = await Transaction.create({
+      userId: user._id,
+      type: 'giftcard',
+      amount: finalPayout,
+      currency: 'NGN',
+      description: `Gift card trade approved for ${trade.brand} ${trade.currency} ${trade.cardValue}`,
+      status: 'completed',
+      reference: `${trade.reference}-CR`,
+      metadata: {
+        giftCardTradeId: trade._id,
+        billType: 'giftcard_trade'
+      }
+    });
+
+    trade.status = 'completed';
+    trade.finalPayout = finalPayout;
+    trade.reviewNote = req.body.note || null;
+    trade.reviewedByUserId = req.userId;
+    trade.reviewedAt = new Date();
+    trade.creditedTransactionId = transaction._id;
+
+    await Promise.all([
+      user.save(),
+      trade.save(),
+      createNotification({
+        user,
+        type: 'receive',
+        title: 'Gift card trade approved',
+        body: `Your wallet has been credited with NGN ${finalPayout.toLocaleString()} for trade ${trade.reference}.`,
+        data: { giftCardTradeId: trade._id, reference: trade.reference, amount: finalPayout },
+        sendEmail: true,
+        emailAmount: finalPayout,
+        emailCurrency: 'NGN',
+        emailReference: trade.reference
+      })
+    ]);
+
+    await logAuditEvent(req, {
+      action: 'admin_approve_giftcard_trade',
+      entityType: 'giftcard_trade',
+      entityId: trade._id,
+      severity: 'warning',
+      metadata: { finalPayout, note: req.body.note || null }
+    });
+    res.json({ message: 'Gift card trade approved', trade, transaction });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+router.post('/giftcard-trades/:id/reject', [param('id').isMongoId(), body('reason').isLength({ min: 3 })], async (req, res) => {
+  try {
+    if (!sendValidation(req, res)) return;
+    const trade = await GiftCardTrade.findById(req.params.id);
+    if (!trade) {
+      return res.status(404).json({ message: 'Gift card trade not found' });
+    }
+    if (!['pending_review', 'more_info_required'].includes(trade.status)) {
+      return res.status(400).json({ message: 'This trade has already been processed' });
+    }
+
+    trade.status = 'rejected';
+    trade.rejectionReason = req.body.reason;
+    trade.reviewedByUserId = req.userId;
+    trade.reviewedAt = new Date();
+    await trade.save();
+
+    const user = await User.findById(trade.userId);
+    if (user) {
+      await createNotification({
+        user,
+        type: 'system',
+        title: 'Gift card trade rejected',
+        body: `Your gift card trade ${trade.reference} was rejected. Reason: ${req.body.reason}`,
+        data: { giftCardTradeId: trade._id, reference: trade.reference },
+        sendEmail: true
+      });
+    }
+
+    await logAuditEvent(req, {
+      action: 'admin_reject_giftcard_trade',
+      entityType: 'giftcard_trade',
+      entityId: trade._id,
+      severity: 'warning',
+      metadata: { reason: req.body.reason }
+    });
+    res.json({ message: 'Gift card trade rejected', trade });
   } catch (error) {
     res.status(500).json({ message: 'Server error' });
   }

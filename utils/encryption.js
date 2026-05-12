@@ -1,10 +1,14 @@
 const crypto = require('crypto');
 
-const ENCRYPTION_SECRET =
-  process.env.ENCRYPTION_KEY ||
-  process.env.JWT_SECRET ||
-  'flamex-default-encryption-secret';
+const ENCRYPTION_SECRET = process.env.ENCRYPTION_KEY;
 const IV_LENGTH = 16;
+
+function getEncryptionKey() {
+  if (!ENCRYPTION_SECRET) {
+    throw new Error('ENCRYPTION_KEY must be set in environment for secure wallet encryption');
+  }
+  return ENCRYPTION_SECRET;
+}
 
 function deriveKey(secret) {
   return crypto.createHash('sha256').update(String(secret)).digest();
@@ -15,7 +19,7 @@ function deriveKey(secret) {
  * @param {string} text - Text to encrypt
  * @returns {string} Encrypted text (iv:encrypted)
  */
-function encrypt(text, secret = ENCRYPTION_SECRET) {
+function encrypt(text, secret = getEncryptionKey()) {
   const iv = crypto.randomBytes(IV_LENGTH);
   const cipher = crypto.createCipheriv(
     'aes-256-cbc',
@@ -32,7 +36,7 @@ function encrypt(text, secret = ENCRYPTION_SECRET) {
  * @param {string} encryptedText - Encrypted text (iv:encrypted)
  * @returns {string} Decrypted text
  */
-function decrypt(encryptedText, secret = ENCRYPTION_SECRET) {
+function decrypt(encryptedText, secret = getEncryptionKey()) {
   const parts = encryptedText.split(':');
   const iv = Buffer.from(parts.shift(), 'hex');
   const encrypted = parts.join(':');

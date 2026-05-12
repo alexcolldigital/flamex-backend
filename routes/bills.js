@@ -4,9 +4,11 @@ const { body, validationResult } = require('express-validator');
 const { authMiddleware } = require('../middleware/auth');
 const User = require('../models/User');
 const Transaction = require('../models/Transaction');
+const GiftCardTrade = require('../models/GiftCardTrade');
 const vtpassService = require('../services/vtpass');
 const { createNotification } = require('../services/notifications');
 const { requireVerifiedKycForTransactions } = require('../middleware/kyc');
+const { getGiftCardConfig, findSupportedCard } = require('../utils/giftcards');
 
 // Nigerian Service Providers
 const PROVIDERS = {
@@ -57,22 +59,7 @@ const PROVIDERS = {
     { id: 'betpawa', name: 'BetPawa', minAmount: 50 }
   ],
 
-  // Gift Card Providers
-  giftcards: {
-    categories: [
-      { id: 'google_play', name: 'Google Play', icon: 'google' },
-      { id: 'apple', name: 'Apple Gift Card', icon: 'apple' },
-      { id: 'amazon', name: 'Amazon', icon: 'amazon' },
-      { id: 'steam', name: 'Steam', icon: 'steam' },
-      { id: 'netflix', name: 'Netflix', icon: 'netflix' },
-      { id: 'spotify', name: 'Spotify', icon: 'spotify' },
-      { id: 'xbox', name: 'Xbox', icon: 'xbox' },
-      { id: 'playstation', name: 'PlayStation', icon: 'playstation' },
-      { id: 'uber', name: 'Uber', icon: 'uber' },
-      { id: 'airbnb', name: 'Airbnb', icon: 'airbnb' }
-    ],
-    denominations: [5, 10, 15, 20, 25, 50, 100, 200, 500]
-  }
+  giftcards: {}
 };
 
 // Data Bundle Plans
@@ -173,8 +160,19 @@ router.get('/providers', authMiddleware, (req, res) => {
 });
 
 // Get providers by type
-router.get('/providers/:type', authMiddleware, (req, res) => {
+router.get('/providers/:type', authMiddleware, async (req, res) => {
   const { type } = req.params;
+  if (type === 'giftcards') {
+    const config = await getGiftCardConfig();
+    return res.json({
+      success: true,
+      type,
+      providers: {
+        disclaimer: config.disclaimer,
+        supportedCards: config.supportedCards
+      }
+    });
+  }
   const providers = PROVIDERS[type];
 
   if (!providers) {
@@ -732,11 +730,33 @@ router.post('/betting', authMiddleware, requireVerifiedKycForTransactions, [
   }
 });
 
-// Buy Gift Card
-router.post('/giftcard', authMiddleware, requireVerifiedKycForTransactions, [
-  body('category').notEmpty(),
-  body('denomination').isFloat({ min: 5 }),
-  body('quantity').isInt({ min: 1, max: 10 }),
+// Manual gift card trade rates
+router.get('/giftcard-rates', authMiddleware, async (req, res) => {
+  try {
+    const config = await getGiftCardConfig();
+    res.json({
+      success: true,
+      disclaimer: config.disclaimer,
+      supportedCards: config.supportedCards
+    });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Submit gift card trade
+router.post('/giftcard-trade', authMiddleware, requireVerifiedKycForTransactions, [
+  body('brand').notEmpty(),
+  body('country').notEmpty(),
+  body('currency').notEmpty(),
+  body('cardValue').isFloat({ min: 1 }),
+  body('cardType').isIn(['physical', 'e_code']),
+  body('submissionMethod').isIn(['images', 'code']),
+  body('frontImageUrl').optional({ nullable: true }).isString(),
+  body('backImageUrl').optional({ nullable: true }).isString(),
+  body('cardCode').optional({ nullable: true }).isString(),
+  body('tradeCodePin').optional({ nullable: true }).isString(),
+  body('note').optional({ nullable: true }).isString(),
   body('pin').isLength({ min: 4, max: 6 })
 ], async (req, res) => {
   try {
@@ -745,7 +765,20 @@ router.post('/giftcard', authMiddleware, requireVerifiedKycForTransactions, [
       return res.status(400).json({ errors: errors.array() });
     }
 
-    const { category, denomination, quantity, pin } = req.body;
+    const {
+      brand,
+      country,
+      currency,
+      cardValue,
+      cardType,
+      submissionMethod,
+      frontImageUrl,
+      backImageUrl,
+      cardCode,
+      tradeCodePin,
+      note,
+      pin
+    } = req.body;
     const user = await User.findById(req.userId);
 
     const pinMatch = await user.comparePin(pin);
@@ -753,64 +786,82 @@ router.post('/giftcard', authMiddleware, requireVerifiedKycForTransactions, [
       return res.status(400).json({ message: 'Invalid PIN' });
     }
 
-    // Calculate total (with 5% fee)
-    const subtotal = denomination * quantity;
-    const fee = subtotal * 0.05;
-    const total = subtotal + fee;
-
-    if (user.balances.NGN < total) {
-      return res.status(400).json({ message: 'Insufficient NGN balance' });
+    if (submissionMethod === 'images' && (!frontImageUrl || !backImageUrl)) {
+      return res.status(400).json({ message: 'Front and back image URLs are required for image submissions' });
+    }
+    if (submissionMethod === 'code' && !cardCode) {
+      return res.status(400).json({ message: 'Gift card code is required for code submissions' });
     }
 
-    const reference = `GIFT-${Date.now()}`;
-    const categoryName = PROVIDERS.giftcards.categories.find(c => c.id === category)?.name || category;
-
-    // Generate gift card codes
-    const codes = [];
-    for (let i = 0; i < quantity; i++) {
-      codes.push({
-        code: Array(16).fill(0).map(() => 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'[Math.floor(Math.random() * 36)]).join(''),
-        pin: Math.floor(1000 + Math.random() * 9000).toString()
-      });
+    const config = await getGiftCardConfig();
+    const supportedCard = findSupportedCard(config, { brand, country, currency });
+    if (!supportedCard) {
+      return res.status(400).json({ message: 'This gift card combination is not supported yet' });
     }
 
-    const transaction = new Transaction({
+    if (!supportedCard.supportedCardTypes.includes(cardType)) {
+      return res.status(400).json({ message: 'Selected card type is not supported for this gift card' });
+    }
+
+    const ratePerUnit = Number(supportedCard.rate);
+    const estimatedPayout = Number((Number(cardValue) * ratePerUnit).toFixed(2));
+    const reference = `GCTR-${Date.now()}`;
+
+    const trade = await GiftCardTrade.create({
       userId: req.userId,
-      type: 'giftcard',
-      amount: total,
-      currency: 'NGN',
-      description: `${categoryName} $${denomination} gift card x${quantity}`,
-      status: 'completed',
-      reference,
-      metadata: { category, denomination, quantity, codes, billType: 'giftcard' }
+      brand,
+      country,
+      currency: String(currency).toUpperCase(),
+      cardValue: Number(cardValue),
+      cardType,
+      submissionMethod,
+      frontImageUrl: frontImageUrl || null,
+      backImageUrl: backImageUrl || null,
+      cardCode: cardCode || null,
+      tradeCodePin: tradeCodePin || null,
+      note: note || null,
+      ratePerUnit,
+      estimatedPayout,
+      reference
     });
-    await transaction.save();
 
-    user.balances.NGN -= total;
-    await user.save();
-
-    await createBillNotification({
+    await createNotification({
       user,
-      transaction,
-      amount: total,
-      detail: `${categoryName} gift card purchase`
+      type: 'system',
+      title: 'Gift card trade submitted',
+      body: `Your ${brand} ${currency} ${cardValue} gift card trade is pending review.`,
+      data: {
+        giftCardTradeId: trade._id,
+        reference,
+        estimatedPayout
+      },
+      sendEmail: true
     });
 
     res.json({
       success: true,
-      message: 'Gift card purchase successful',
+      message: 'Gift card trade submitted successfully',
       reference,
-      newBalance: user.balances.NGN,
+      status: trade.status,
       details: {
-        category: categoryName,
-        denomination,
-        quantity,
-        subtotal,
-        fee,
-        total,
-        codes
+        brand,
+        country,
+        currency: String(currency).toUpperCase(),
+        cardValue: Number(cardValue),
+        ratePerUnit,
+        estimatedPayout,
+        disclaimer: config.disclaimer
       }
     });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+router.get('/giftcard-trades', authMiddleware, async (req, res) => {
+  try {
+    const trades = await GiftCardTrade.find({ userId: req.userId }).sort({ createdAt: -1 }).limit(100);
+    res.json({ success: true, trades });
   } catch (error) {
     res.status(500).json({ message: 'Server error' });
   }
