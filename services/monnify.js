@@ -317,13 +317,17 @@ class MonnifyService {
   /**
    * Webhook handler for payment notifications
    */
-  handleWebhook(payload, signature) {
+  handleWebhook(payload, signature, rawBody = null) {
+    if (!this.secretKey) {
+      return { valid: false, error: 'Monnify secret not configured' };
+    }
+
     const expectedSignature = crypto
       .createHmac('sha512', this.secretKey)
-      .update(JSON.stringify(payload))
+      .update(rawBody || JSON.stringify(payload))
       .digest('hex');
 
-    if (signature !== expectedSignature) {
+    if (!signature || signature !== expectedSignature) {
       return { valid: false, error: 'Invalid signature' };
     }
 

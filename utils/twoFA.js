@@ -82,7 +82,7 @@ async function sendOTPEmail(user, otp, context = 'transfer') {
 
   await createNotification({
     user,
-    type: 'alert',
+    type: 'security',
     title: 'Confirm your ' + contextLabel,
     body: `Your verification code is: ${otp}. This code expires in 5 minutes.`,
     data: {
@@ -110,7 +110,9 @@ function requires2FA(user, transferAmount) {
   // 3. Any withdrawal
   
   const largeTransferThreshold = 1000; // NGN
-  const enabledFor2FA = user.security?.require2FAForTransfers === true;
+  const enabledFor2FA =
+    user.settings?.security?.twoFactorEnabled === true ||
+    user.settings?.security?.transactionConfirmation === true;
   
   return enabledFor2FA || transferAmount > largeTransferThreshold;
 }

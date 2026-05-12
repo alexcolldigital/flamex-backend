@@ -10,6 +10,37 @@ const { AppError, handleError, asyncHandler } = require('../utils/errorHandler')
 const { withTransaction } = require('../utils/database');
 const Logger = require('../utils/logger');
 
+async function findDepositTransaction(reference, eventData = {}) {
+  if (!reference) return null;
+
+  let transaction = await Transaction.findOne({ reference });
+  if (transaction) return transaction;
+
+  transaction = await Transaction.findOne({ 'metadata.monnifyReference': reference });
+  if (transaction) return transaction;
+
+  const paymentReference = eventData.paymentReference || eventData.transactionReference || eventData.transactionRef;
+  if (paymentReference) {
+    transaction = await Transaction.findOne({ reference: paymentReference });
+    if (transaction) return transaction;
+  }
+
+  const destinationAccountNumber =
+    eventData.destinationAccountInformation?.accountNumber ||
+    eventData.destinationAccountNumber ||
+    eventData.accountNumber;
+
+  if (destinationAccountNumber) {
+    transaction = await Transaction.findOne({
+      type: 'deposit',
+      status: 'pending',
+      'metadata.bankDetails.accountNumber': destinationAccountNumber
+    }).sort({ createdAt: -1 });
+  }
+
+  return transaction;
+}
+
 // Get deposit address for crypto
 router.get('/address/:chainId', authMiddleware, asyncHandler(async (req, res) => {
   const logger = new Logger('deposit/address');
@@ -51,7 +82,7 @@ router.post('/ngn', authMiddleware, [
   }
 
   const user = await User.findById(req.userId);
-  const { amount } = req.body;
+  const amount = Number(req.body.amount);
   const reference = `DP-NGN-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
 
   let bankDetails = null;
@@ -129,11 +160,9 @@ router.post('/webhooks/monnify', asyncHandler(async (req, res) => {
   const logger = new Logger('deposit/webhooks/monnify');
   
   try {
-    const { eventType, eventData } = req.body;
-
     // Verify webhook signature
     const signature = req.headers['monnify-signature'];
-    const verification = monnifyService.handleWebhook(req.body, signature);
+    const verification = monnifyService.handleWebhook(req.body, signature, req.rawBody);
     if (!verification.valid) {
       logger.warn('Invalid Monnify webhook signature', { error: verification.error });
       return res.status(401).json({ error: 'Invalid signature' });
@@ -145,10 +174,15 @@ router.post('/webhooks/monnify', asyncHandler(async (req, res) => {
     const payload = verification.data;
     const { eventType, eventData } = payload;
     if (eventType === 'SUCCESSFUL_TRANSACTION' || eventType === 'INCOMING_TRANSFER') {
-      const { reference, amount, metadata } = eventData;
+      const reference =
+        eventData.transactionReference ||
+        eventData.paymentReference ||
+        eventData.reference ||
+        eventData.transactionRef;
+      const amount = Number(eventData.amountPaid || eventData.amount || 0);
 
       // Find transaction by reference
-      const transaction = await Transaction.findOne({ reference });
+      const transaction = await findDepositTransaction(reference, eventData);
       
       if (!transaction) {
         logger.warn(`Transaction not found for reference: ${reference}`);
@@ -164,8 +198,12 @@ router.post('/webhooks/monnify', asyncHandler(async (req, res) => {
       await withTransaction(async (session) => {
         // Update transaction status
         transaction.status = 'completed';
-        transaction.metadata.monnifyReference = reference;
-        transaction.metadata.confirmedAt = new Date().toISOString();
+        transaction.metadata = {
+          ...(transaction.metadata?.toObject ? transaction.metadata.toObject() : transaction.metadata || {}),
+          monnifyReference: reference,
+          monnifyPaymentReference: eventData.paymentReference || null,
+          confirmedAt: new Date().toISOString()
+        };
         await transaction.save({ session });
 
         // Credit user balance
@@ -227,10 +265,20 @@ router.post('/webhooks/flutterwave', asyncHandler(async (req, res) => {
 
     // Handle successful transfer events
     if (event === 'Transfer.Complete' && data?.status === 'SUCCESSFUL') {
-      const { reference, amount, meta } = data;
+      const reference = data.tx_ref || data.txRef || data.reference || data.id;
+      const amount = Number(data.amount || 0);
 
       // Find transaction by reference
-      const transaction = await Transaction.findOne({ reference });
+      const transaction =
+        (await Transaction.findOne({ reference })) ||
+        (await Transaction.findOne({ 'metadata.flutterwaveReference': reference })) ||
+        (data.account_number
+          ? await Transaction.findOne({
+              type: 'deposit',
+              status: 'pending',
+              'metadata.bankDetails.accountNumber': data.account_number
+            }).sort({ createdAt: -1 })
+          : null);
 
       if (!transaction) {
         logger.warn(`Transaction not found for reference: ${reference}`);
@@ -244,8 +292,12 @@ router.post('/webhooks/flutterwave', asyncHandler(async (req, res) => {
 
       await withTransaction(async (session) => {
         transaction.status = 'completed';
-        transaction.metadata.flutterwaveReference = reference;
-        transaction.metadata.confirmedAt = new Date().toISOString();
+        transaction.metadata = {
+          ...(transaction.metadata?.toObject ? transaction.metadata.toObject() : transaction.metadata || {}),
+          flutterwaveReference: reference,
+          flutterwaveId: data.id || null,
+          confirmedAt: new Date().toISOString()
+        };
         await transaction.save({ session });
 
         const user = await User.findById(transaction.userId);

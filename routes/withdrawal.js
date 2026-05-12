@@ -78,7 +78,7 @@ router.post('/ngn/request-otp', authMiddleware, requireVerifiedKycForTransaction
     return res.status(400).json({ errors: errors.array() });
   }
 
-  const { amount } = req.body;
+  const amount = Number(req.body.amount);
   const user = await User.findById(req.userId);
 
   if (user.balances.NGN < amount) {
@@ -116,8 +116,9 @@ router.post('/ngn', authMiddleware, requireVerifiedKycForTransactions, [
     return res.status(400).json({ errors: errors.array() });
   }
 
-  const { amount, bankCode, accountNumber, accountName, pin, otp } = req.body;
-  const user = await User.findById(req.userId);
+  const amount = Number(req.body.amount);
+  const { bankCode, accountNumber, accountName, pin, otp } = req.body;
+  let user = await User.findById(req.userId);
 
   // Verify PIN
   const pinMatch = await user.comparePin(pin);
@@ -263,7 +264,7 @@ router.post('/crypto/request-otp', authMiddleware, requireVerifiedKycForTransact
     return res.status(400).json({ errors: errors.array() });
   }
 
-  const { amount } = req.body;
+  const amount = Number(req.body.amount);
   const user = await User.findById(req.userId);
 
   // For crypto, always require 2FA if large amount
@@ -298,7 +299,9 @@ router.post('/crypto', authMiddleware, requireVerifiedKycForTransactions, [
     return res.status(400).json({ errors: errors.array() });
   }
 
-  const { chainId, token, amount, toAddress, pin, gasFeeEstimate = 0, otp } = req.body;
+  const amount = Number(req.body.amount);
+  const gasFeeEstimate = Number(req.body.gasFeeEstimate || 0);
+  const { chainId, token, toAddress, pin, otp } = req.body;
   const tokenUpper = token.toUpperCase();
   
   let user = await User.findById(req.userId);

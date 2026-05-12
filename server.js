@@ -74,8 +74,13 @@ app.use('/api/auth/login', authLimiter);
 app.use('/api/auth/register', authLimiter);
 app.use('/api/auth/admin/login', authLimiter);
 
-// Body parsing with size limits
-app.use(express.json({ limit: '10mb' }));
+// Body parsing with size limits and raw body capture for webhook signature verification
+app.use(express.json({
+  limit: '10mb',
+  verify: (req, _res, buf) => {
+    req.rawBody = buf.toString('utf8');
+  }
+}));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
 // HTTP request logging

@@ -27,8 +27,16 @@ const userSchema = new mongoose.Schema({
   
   kycVerified: { type: Boolean, default: false },
   kycLevel: { type: Number, default: 0 },
+  kycVerifiedAt: { type: Date, default: null },
   bvn: { type: String, default: null },
   nin: { type: String, default: null },
+  kycVerificationDetails: {
+    bvn: { type: mongoose.Schema.Types.Mixed, default: null },
+    nin: { type: mongoose.Schema.Types.Mixed, default: null },
+    selfieBvn: { type: mongoose.Schema.Types.Mixed, default: null },
+    selfieNin: { type: mongoose.Schema.Types.Mixed, default: null },
+    liveness: { type: mongoose.Schema.Types.Mixed, default: null }
+  },
   
   wallets: [{
     chainId: { type: String, required: true },
@@ -113,6 +121,13 @@ const userSchema = new mongoose.Schema({
   },
   
   lastLoginAt: { type: Date, default: null },
+  otpVerification: {
+    hash: { type: String, default: null },
+    context: { type: String, default: null },
+    expiresAt: { type: Date, default: null },
+    attempts: { type: Number, default: 0 },
+    maxAttempts: { type: Number, default: 3 }
+  },
   createdAt: { type: Date, default: Date.now },
   updatedAt: { type: Date, default: Date.now }
 });

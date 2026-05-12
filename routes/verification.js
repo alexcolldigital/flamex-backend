@@ -373,4 +373,70 @@ router.get('/kyc-status', authMiddleware, async (req, res) => {
   }
 });
 
+/**
+ * Subscribe Dojah webhook
+ */
+router.post('/subscribe-webhook', authMiddleware, [
+  body('webhook').isURL(),
+  body('service').isString().isLength({ min: 2 })
+], async (req, res) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ errors: errors.array() });
+    }
+
+    const result = await dojahService.subscribeWebhook({
+      webhook: req.body.webhook,
+      service: req.body.service
+    });
+
+    if (!result.success) {
+      return res.status(400).json({ message: 'Failed to subscribe webhook', error: result.error });
+    }
+
+    res.json({
+      message: 'Dojah webhook subscribed successfully',
+      data: result.data
+    });
+  } catch (error) {
+    console.error('Dojah webhook subscription error:', error);
+    res.status(500).json({ message: 'Server error during webhook subscription' });
+  }
+});
+
+/**
+ * Dojah webhook receiver
+ */
+router.post('/webhooks/dojah', async (req, res) => {
+  try {
+    const verification = dojahService.verifyWebhookSignature(req.body, req.headers, req.rawBody);
+    if (!verification.valid) {
+      return res.status(401).json({ message: 'Invalid Dojah webhook signature' });
+    }
+
+    const referenceId = req.body.reference_id || req.body.referenceId || req.body.customer_reference;
+    if (referenceId) {
+      const user = await User.findOne({
+        $or: [
+          { 'kycVerificationDetails.bvn.reference_id': referenceId },
+          { 'kycVerificationDetails.nin.reference_id': referenceId },
+          { 'kycVerificationDetails.selfieBvn.reference_id': referenceId },
+          { 'kycVerificationDetails.selfieNin.reference_id': referenceId }
+        ]
+      });
+
+      if (user && String(req.body.status || '').toLowerCase() === 'completed') {
+        user.kycVerifiedAt = user.kycVerifiedAt || new Date();
+        await user.save();
+      }
+    }
+
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Dojah webhook error:', error);
+    res.status(200).json({ success: false, error: error.message });
+  }
+});
+
 module.exports = router;

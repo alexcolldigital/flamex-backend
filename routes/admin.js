@@ -4,6 +4,7 @@ const { authMiddleware } = require('../middleware/auth');
 const { adminMiddleware } = require('../middleware/admin');
 const User = require('../models/User');
 const Transaction = require('../models/Transaction');
+const Referral = require('../models/Referral');
 const PlatformLedger = require('../models/PlatformLedger');
 const AuditLog = require('../models/AuditLog');
 const P2POrder = require('../models/P2POrder');
@@ -672,6 +673,84 @@ router.get('/dashboard/system-health', async (req, res) => {
     treasury: 'operational',
     checkedAt: new Date().toISOString()
   });
+});
+
+router.get('/referrals', async (req, res) => {
+  try {
+    const referrals = await Referral.find()
+      .sort({ totalReferrals: -1, totalRewards: -1 })
+      .limit(200)
+      .populate('userId', 'firstName lastName email username')
+      .populate('referredUsers.userId', 'firstName lastName email username');
+
+    const records = referrals.flatMap((referral) =>
+      (referral.referredUsers || []).map((entry) => ({
+        _id: `${referral._id}-${entry.userId?._id || entry._id || entry.joinedAt?.getTime?.() || Math.random()}`,
+        referrerId: referral.userId?._id || referral.userId,
+        referrer: referral.userId
+          ? {
+              _id: referral.userId._id,
+              fullName: `${referral.userId.firstName || ''} ${referral.userId.lastName || ''}`.trim(),
+              email: referral.userId.email,
+              username: referral.userId.username
+            }
+          : null,
+        referredId: entry.userId?._id || entry.userId,
+        referred: entry.userId
+          ? {
+              _id: entry.userId._id,
+              fullName: `${entry.userId.firstName || ''} ${entry.userId.lastName || ''}`.trim(),
+              email: entry.userId.email,
+              username: entry.userId.username
+            }
+          : null,
+        commission: Number(entry.rewardsEarned || 0),
+        status: entry.rewardsEarned > 0 ? 'paid' : 'pending',
+        createdAt: entry.joinedAt
+      }))
+    );
+
+    res.json({ referrals: records });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+router.get('/referrals/stats', async (req, res) => {
+  try {
+    const referrals = await Referral.find().limit(500);
+    const stats = referrals.reduce(
+      (acc, referral) => {
+        acc.totalReferrals += Number(referral.totalReferrals || 0);
+        acc.totalCommission += Number(referral.totalRewards || 0);
+        acc.pendingCommission += Number(referral.pendingRewards || 0);
+        acc.paidCommission += Number(referral.claimedRewards || 0);
+        return acc;
+      },
+      { totalReferrals: 0, totalCommission: 0, pendingCommission: 0, paidCommission: 0 }
+    );
+
+    res.json(stats);
+  } catch (error) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+router.put('/referrals/commission-rate', [body('rate').isFloat({ min: 0, max: 100 })], async (req, res) => {
+  try {
+    if (!sendValidation(req, res)) return;
+    const settings = await savePlatformSettings({ referralCommissionRate: Number(req.body.rate) }, req.userId);
+    await logAuditEvent(req, {
+      action: 'admin_update_referral_commission_rate',
+      entityType: 'platform_setting',
+      entityId: 'referralCommissionRate',
+      severity: 'warning',
+      metadata: { rate: Number(req.body.rate) }
+    });
+    res.json({ message: 'Referral commission rate updated', rate: settings.referralCommissionRate });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error' });
+  }
 });
 
 router.get('/settings', async (req, res) => {

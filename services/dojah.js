@@ -5,12 +5,14 @@
  */
 
 const axios = require('axios');
+const crypto = require('crypto');
 
 class DojahService {
   constructor() {
     this.baseUrl = 'https://api.dojah.io/api/v1';
     this.appId = process.env.DOJAH_APP_ID;
     this.apiKey = process.env.DOJAH_API_KEY;
+    this.webhookSecret = process.env.DOJAH_WEBHOOK_SECRET || process.env.DOJAH_API_KEY;
     this.isConfigured = !!(this.appId && this.apiKey);
   }
 
@@ -20,9 +22,65 @@ class DojahService {
   getHeaders() {
     return {
       'Content-Type': 'application/json',
-      'Authorization': `Bearer ${this.apiKey}`,
+      'Authorization': this.apiKey,
       'AppId': this.appId
     };
+  }
+
+  verifyWebhookSignature(payload, headers = {}, rawBody = null) {
+    const signature = headers['x-dojah-signature'] || headers['X-Dojah-Signature'];
+    const signatureV2 = headers['x-dojah-signature-v2'] || headers['X-Dojah-Signature-V2'];
+
+    if (signature) {
+      const expected = crypto
+        .createHmac('sha256', this.webhookSecret)
+        .update(rawBody || JSON.stringify(payload))
+        .digest('hex');
+
+      return {
+        valid: signature === expected,
+        mode: 'payload',
+        expected,
+        received: signature
+      };
+    }
+
+    if (signatureV2) {
+      const expected = crypto.createHash('sha256').update(this.webhookSecret).digest('hex');
+      return {
+        valid: signatureV2 === expected,
+        mode: 'secret',
+        expected,
+        received: signatureV2
+      };
+    }
+
+    return { valid: false, mode: 'missing', error: 'Missing Dojah signature header' };
+  }
+
+  async subscribeWebhook({ webhook, service }) {
+    if (!this.isConfigured) {
+      return { success: false, error: 'Dojah not configured' };
+    }
+
+    try {
+      const response = await axios.post(
+        `${this.baseUrl}/webhook/subscribe`,
+        { webhook, service },
+        { headers: this.getHeaders() }
+      );
+
+      return {
+        success: true,
+        data: response.data
+      };
+    } catch (error) {
+      console.error('Dojah webhook subscribe error:', error.response?.data || error.message);
+      return {
+        success: false,
+        error: error.response?.data?.message || error.message
+      };
+    }
   }
 
   /**

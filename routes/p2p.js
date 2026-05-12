@@ -418,11 +418,12 @@ router.post(
       logger.info(`P2P order created: ${order.reference}, seller: ${seller._id}, buyer: ${buyer._id}, amount: ${cryptoAmount} ${offer.asset}`);
 
       // Send notifications
+      const buyerMessage = offer.side === 'sell' ? 'buy' : 'sell';
       await createNotification({
         user: buyer,
         type: 'receive',
         title: 'P2P order created',
-        body: `You have a pending P2P order to ${order.side === 'buy' ? 'buy' : 'sell'} ${cryptoAmount} ${offer.asset}. Complete payment within ${offer.paymentWindowMinutes} minutes.`,
+        body: `You have a pending P2P order to ${buyerMessage} ${cryptoAmount} ${offer.asset}. Complete payment within ${offer.paymentWindowMinutes} minutes.`,
         data: {
           orderId: order._id,
           reference: order.reference,
@@ -692,7 +693,7 @@ router.post(
       if (otherUser) {
         await createNotification({
           user: otherUser,
-          type: 'alert',
+          type: 'p2p',
           title: 'P2P order cancelled',
           body: `The P2P order for ${order.cryptoAmount} ${order.asset} has been cancelled.`,
           data: {
