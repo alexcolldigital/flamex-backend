@@ -89,7 +89,7 @@ router.post('/ngn', authMiddleware, [
     throw new AppError('Profile name is required before creating a deposit account', 400);
   }
 
-  if (!user.email) {
+  if (!user.email || user.email.trim() === '') {
     throw new AppError('Email is required before creating a deposit account', 400);
   }
 

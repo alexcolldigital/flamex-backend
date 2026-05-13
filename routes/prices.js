@@ -58,7 +58,11 @@ router.get('/', async (req, res) => {
     
     res.json(prices);
   } catch (error) {
-    console.error('Price fetch error:', error.message);
+    if (error.response?.status === 429) {
+      console.warn('Price fetch rate limited, using fallback prices');
+    } else {
+      console.error('Price fetch error:', error.message);
+    }
     
     // Return fallback prices
     res.json({

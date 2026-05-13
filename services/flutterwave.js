@@ -343,6 +343,10 @@ class FlutterwaveService {
       txRef
     } = params;
 
+    if (!email || email.trim() === '') {
+      return { success: false, error: 'email is required' };
+    }
+
     try {
       const response = await axios.post(
         `${this.baseUrl}/virtual-account-numbers`,

@@ -34,13 +34,16 @@ async function createNotification({
   );
 
   if (allowEmail) {
-    await emailService.sendTransactionEmail({
+    // Send email asynchronously to avoid blocking API response
+    emailService.sendTransactionEmail({
       to: user.email,
       title,
       body,
       amount: emailAmount,
       currency: emailCurrency,
       reference: emailReference
+    }).catch(error => {
+      console.error('Failed to send notification email:', error.message);
     });
   }
 

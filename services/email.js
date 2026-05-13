@@ -45,6 +45,7 @@ class EmailService {
       return { success: true };
     } catch (error) {
       console.error('Email send error:', error.message);
+      // Don't throw error - make email failures non-blocking in development
       return { success: false, error: error.message };
     }
   }
