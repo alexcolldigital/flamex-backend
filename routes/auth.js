@@ -14,7 +14,6 @@ const { createNotification } = require('../services/notifications');
 const { isAdminUser, buildAdminProfile } = require('../utils/admin');
 const { logAuditEvent } = require('../services/audit');
 const { getPlatformSettings } = require('../utils/admin');
-const dojahService = require('../services/dojah');
 
 const createUserSecret = (password) => {
   return `${password}:${process.env.JWT_SECRET || 'flamex-secret-key-change-in-production'}`;
@@ -537,55 +536,34 @@ router.post('/kyc', authMiddleware, [
     }
 
     const user = await User.findById(req.userId);
-    
-    // Verify with Dojah
-    let bvnVerified = false;
-    let ninVerified = false;
-    let verificationDetails = {};
+
+    if (firstName) {
+      user.firstName = firstName;
+    }
+
+    if (lastName) {
+      user.lastName = lastName;
+    }
+
+    if (phoneNumber) {
+      user.phone = phoneNumber;
+    }
 
     if (bvn) {
-      const bvnResult = await dojahService.verifyBvn({
-        bvn,
-        firstName: firstName || user.firstName,
-        lastName: lastName || user.lastName,
-        phoneNumber: phoneNumber || user.phone
-      });
-
-      if (bvnResult.success) {
-        bvnVerified = true;
-        user.bvn = bvn;
-        verificationDetails.bvn = bvnResult.data;
-      } else {
-        return res.status(400).json({ 
-          message: 'BVN verification failed',
-          error: bvnResult.error 
-        });
-      }
+      user.bvn = bvn;
     }
 
     if (nin) {
-      const ninResult = await dojahService.verifyNin({
-        nin,
-        firstName: firstName || user.firstName,
-        lastName: lastName || user.lastName
-      });
-
-      if (ninResult.success) {
-        ninVerified = true;
-        user.nin = nin;
-        verificationDetails.nin = ninResult.data;
-      } else {
-        return res.status(400).json({ 
-          message: 'NIN verification failed',
-          error: ninResult.error 
-        });
-      }
+      user.nin = nin;
     }
 
-    // Update user KYC status
-    user.kycLevel = (bvnVerified && ninVerified) ? 2 : 1;
-    user.kycVerified = bvnVerified && ninVerified;
-    user.kycVerificationDetails = verificationDetails;
+    user.kycVerified = true;
+    user.kycLevel = 0;
+    user.kycVerificationDetails = {
+      submittedAt: new Date().toISOString(),
+      bvn: !!bvn,
+      nin: !!nin
+    };
     user.kycVerifiedAt = new Date();
     await user.save();
 
@@ -594,7 +572,7 @@ router.post('/kyc', authMiddleware, [
       type: 'kyc',
       amount: 0,
       currency: 'NGN',
-      description: `KYC verified - BVN: ${bvnVerified}, NIN: ${ninVerified}`,
+      description: `KYC submitted - BVN: ${!!bvn}, NIN: ${!!nin}`,
       status: 'completed',
       reference: `KYC-${Date.now()}`
     });
@@ -603,27 +581,23 @@ router.post('/kyc', authMiddleware, [
     await createNotification({
       user,
       type: 'security',
-      title: user.kycVerified ? 'KYC verification complete' : 'KYC verification partial',
-      body: user.kycVerified
-        ? 'Your KYC has been successfully verified. You now have full access to all features.'
-        : 'Your partial KYC verification was successful. Complete remaining verifications to unlock all features.',
+      title: 'KYC submitted',
+      body: 'Your KYC information has been submitted successfully.',
       sendEmail: true
     });
 
     await logAuditEvent(req, {
       actorUserId: user._id,
       actorEmail: user.email,
-      action: 'kyc_verified',
+      action: 'kyc_submitted',
       entityType: 'user',
       entityId: user._id,
-      metadata: { kycLevel: user.kycLevel, verified: user.kycVerified }
+      metadata: { verified: user.kycVerified, bvn: !!bvn, nin: !!nin }
     });
 
     res.json({
-      message: user.kycVerified ? 'KYC verified successfully' : 'KYC partially verified',
+      message: 'KYC submitted successfully',
       kycVerified: user.kycVerified,
-      kycLevel: user.kycLevel,
-      verificationDetails,
       user: sanitizeUser(user)
     });
   } catch (error) {

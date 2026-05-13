@@ -157,7 +157,6 @@ app.use('/api/transfer', require('./routes/transfer'));
 app.use('/api/p2p', require('./routes/p2p'));
 app.use('/api/prices', require('./routes/prices'));
 app.use('/api/notifications', require('./routes/notifications'));
-app.use('/api/verification', require('./routes/verification'));
 app.use('/api/admin', require('./routes/admin'));
 
 // Health check endpoint

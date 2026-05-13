@@ -4,7 +4,7 @@ const { body, validationResult } = require('express-validator');
 const { authMiddleware } = require('../middleware/auth');
 const User = require('../models/User');
 const Transaction = require('../models/Transaction');
-const monnifyService = require('../services/monnify');
+const flutterwaveService = require('../services/flutterwave');
 const { createNotification } = require('../services/notifications');
 const { AppError, handleError, asyncHandler } = require('../utils/errorHandler');
 const { withTransaction } = require('../utils/database');
@@ -14,9 +14,6 @@ async function findDepositTransaction(reference, eventData = {}) {
   if (!reference) return null;
 
   let transaction = await Transaction.findOne({ reference });
-  if (transaction) return transaction;
-
-  transaction = await Transaction.findOne({ 'metadata.monnifyReference': reference });
   if (transaction) return transaction;
 
   const paymentReference = eventData.paymentReference || eventData.transactionReference || eventData.transactionRef;
@@ -102,43 +99,42 @@ router.post('/ngn', authMiddleware, [
   }
 
   let bankDetails = null;
-  let monnifyResult = null;
+  let providerResult = null;
 
   try {
-    if (monnifyService.isConfigured) {
-      monnifyResult = await monnifyService.createReservedAccount({
-        userId: user._id.toString(),
-        userName: customerName,
+    if (flutterwaveService.isConfigured) {
+      providerResult = await flutterwaveService.createVirtualAccount({
+        customerName,
         email: user.email,
-        bvn: customerBvn,
-        nin: customerNin
+        phone: user.phone,
+        preferredBank: '044',
+        txRef: reference
       });
 
-      if (monnifyResult.success) {
-        const primaryAccount = monnifyResult.accounts?.[0] || {};
+      if (providerResult.success) {
+        const accountData = providerResult.data || {};
         bankDetails = {
-          bankName: primaryAccount.bankName || monnifyResult.bank?.name || 'Monnify',
-          bankCode: primaryAccount.bankCode || monnifyResult.bank?.code || '',
-          accountNumber: primaryAccount.accountNumber || '',
-          accountName: primaryAccount.accountName || customerName,
-          monnifyAccountId: primaryAccount.accountNumber || null,
-          accountReference: monnifyResult.accountReference || null,
-          reservationReference: monnifyResult.reservationReference || null
+          bankName: accountData.bank_name || accountData.bank || 'Flutterwave',
+          bankCode: accountData.bank_code || accountData.bankCode || '044',
+          accountNumber: accountData.account_number || accountData.accountNumber || '',
+          accountName: accountData.account_name || customerName,
+          flutterwaveAccountId: accountData.id || accountData.account_number || null,
+          txRef: accountData.tx_ref || reference
         };
       } else {
-        logger.warn('Monnify reserved account creation failed', {
+        logger.warn('Flutterwave virtual account creation failed', {
           userId: req.userId,
-          error: monnifyResult.error
+          error: providerResult.error
         });
       }
     }
   } catch (error) {
-    logger.error(`Failed to create Monnify reserved account: ${error.message}`);
+    logger.error(`Failed to create Flutterwave virtual account: ${error.message}`);
     throw new AppError('Failed to create bank account. Please try again.', 503);
   }
 
   if (!bankDetails) {
-    throw new AppError(monnifyResult?.error || 'Bank account creation service not available', 503);
+    throw new AppError(providerResult?.error || 'Bank account creation service not available', 503);
   }
 
   // Create transaction record
@@ -152,7 +148,7 @@ router.post('/ngn', authMiddleware, [
     reference,
     metadata: {
       bankDetails,
-      monnifyAccountId: bankDetails.monnifyAccountId,
+      provider: 'flutterwave',
       expiresAt: new Date(Date.now() + 30 * 60 * 1000).toISOString()
     }
   });
@@ -173,98 +169,6 @@ router.post('/ngn', authMiddleware, [
       'Deposit will be credited to your account once payment is confirmed'
     ]
   });
-}));
-
-/**
- * WEBHOOK: Monnify Webhook Handler
- * Receives payment notifications from Monnify
- * Path: /webhooks/monnify (must be registered in Monnify dashboard)
- */
-router.post('/webhooks/monnify', asyncHandler(async (req, res) => {
-  const logger = new Logger('deposit/webhooks/monnify');
-  
-  try {
-    // Verify webhook signature
-    const signature = req.headers['monnify-signature'];
-    const verification = monnifyService.handleWebhook(req.body, signature, req.rawBody);
-    if (!verification.valid) {
-      logger.warn('Invalid Monnify webhook signature', { error: verification.error });
-      return res.status(401).json({ error: 'Invalid signature' });
-    }
-
-    logger.info(`Monnify webhook received: ${verification.event}`);
-
-    // Handle payment success event
-    const payload = verification.data;
-    const { eventType, eventData } = payload;
-    if (eventType === 'SUCCESSFUL_TRANSACTION' || eventType === 'INCOMING_TRANSFER') {
-      const reference =
-        eventData.transactionReference ||
-        eventData.paymentReference ||
-        eventData.reference ||
-        eventData.transactionRef;
-      const amount = Number(eventData.amountPaid || eventData.amount || 0);
-
-      // Find transaction by reference
-      const transaction = await findDepositTransaction(reference, eventData);
-      
-      if (!transaction) {
-        logger.warn(`Transaction not found for reference: ${reference}`);
-        return res.json({ success: true, message: 'Acknowledged' }); // Acknowledge to prevent retries
-      }
-
-      if (transaction.status === 'completed') {
-        logger.info(`Transaction already completed: ${reference}`);
-        return res.json({ success: true, message: 'Already processed' });
-      }
-
-      // Use transaction to ensure atomicity
-      await withTransaction(async (session) => {
-        // Update transaction status
-        transaction.status = 'completed';
-        transaction.metadata = {
-          ...(transaction.metadata?.toObject ? transaction.metadata.toObject() : transaction.metadata || {}),
-          monnifyReference: reference,
-          monnifyPaymentReference: eventData.paymentReference || null,
-          confirmedAt: new Date().toISOString()
-        };
-        await transaction.save({ session });
-
-        // Credit user balance
-        const user = await User.findById(transaction.userId);
-        if (!user) {
-          throw new AppError('User not found', 404);
-        }
-
-        user.balances.NGN = (user.balances.NGN || 0) + amount;
-        await user.save({ session });
-
-        // Send notification
-        await createNotification({
-          user,
-          type: 'receive',
-          title: 'Deposit confirmed',
-          body: `Your deposit of ₦${amount.toLocaleString()} has been credited to your wallet.`,
-          data: {
-            reference,
-            amount,
-            currency: 'NGN',
-            transactionId: transaction._id
-          },
-          sendEmail: true
-        });
-      });
-
-      logger.info(`Deposit confirmed: ${reference}, amount: ${amount}, user: ${transaction.userId}`);
-    }
-
-    // Always return success to acknowledge webhook
-    res.json({ success: true, message: 'Webhook processed' });
-  } catch (error) {
-    logger.error(`Webhook processing error: ${error.message}`);
-    // Still return 200 to prevent Monnify from retrying on server errors
-    res.json({ success: false, error: error.message });
-  }
 }));
 
 /**

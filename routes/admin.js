@@ -11,7 +11,6 @@ const P2POrder = require('../models/P2POrder');
 const P2PDispute = require('../models/P2PDispute');
 const GiftCardTrade = require('../models/GiftCardTrade');
 const Notification = require('../models/Notification');
-const monnifyService = require('../services/monnify');
 const flutterwaveService = require('../services/flutterwave');
 const { getPlatformSettings, savePlatformSettings } = require('../utils/admin');
 const { getTreasuryBalances, getTreasurySummary, createLedgerEntry } = require('../services/platformLedger');
@@ -868,16 +867,7 @@ router.post(
           return res.status(400).json({ message: 'NGN treasury withdrawals require accountNumber, bankCode, and accountName' });
         }
 
-        if (monnifyService.isConfigured) {
-          providerResponse = await monnifyService.initiateTransfer({
-            amount,
-            accountNumber: destination.accountNumber,
-            bankCode: destination.bankCode,
-            accountName: destination.accountName,
-            narration: req.body.note || 'FlameX treasury withdrawal',
-            reference
-          });
-        } else if (flutterwaveService.isConfigured) {
+        if (flutterwaveService.isConfigured) {
           providerResponse = await flutterwaveService.initiateTransfer({
             amount,
             accountNumber: destination.accountNumber,
@@ -887,6 +877,8 @@ router.post(
             reference,
             currency: 'NGN'
           });
+        } else {
+          throw new Error('Bank transfer service not configured');
         }
 
         if (providerResponse?.success === false) {

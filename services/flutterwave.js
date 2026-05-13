@@ -13,7 +13,7 @@ class FlutterwaveService {
     this.publicKey = process.env.FLUTTERWAVE_PUBLIC_KEY;
     this.secretKey = process.env.FLUTTERWAVE_SECRET_KEY;
     this.encryptionKey = process.env.FLUTTERWAVE_ENCRYPTION_KEY;
-    this.isConfigured = !!(this.publicKey && this.secretKey && this.encryptionKey);
+    this.isConfigured = !!this.secretKey;
   }
 
   /**
@@ -322,6 +322,52 @@ class FlutterwaveService {
       };
     } catch (error) {
       console.error('Flutterwave withdraw error:', error.response?.data || error.message);
+      return { success: false, error: error.response?.data?.message || error.message };
+    }
+  }
+
+  /**
+   * Create a virtual account for bank transfers
+   * @param {object} params - Virtual account parameters
+   */
+  async createVirtualAccount(params) {
+    if (!this.isConfigured) {
+      return { success: false, error: 'Flutterwave not configured' };
+    }
+
+    const {
+      customerName,
+      email,
+      phone,
+      preferredBank = '044',
+      txRef
+    } = params;
+
+    try {
+      const response = await axios.post(
+        `${this.baseUrl}/virtual-account-numbers`,
+        {
+          customer: {
+            name: customerName,
+            email,
+            phone_number: phone,
+            customertoken: txRef
+          },
+          preferred_bank: preferredBank,
+          tx_ref: txRef || `FLAMEX_VA_${Date.now()}`,
+          narration: `FlameX deposit account`,
+          is_permanent: false
+        },
+        { headers: this.getHeaders() }
+      );
+
+      return {
+        success: true,
+        data: response.data.data,
+        message: response.data.message
+      };
+    } catch (error) {
+      console.error('Flutterwave virtual account error:', error.response?.data || error.message);
       return { success: false, error: error.response?.data?.message || error.message };
     }
   }

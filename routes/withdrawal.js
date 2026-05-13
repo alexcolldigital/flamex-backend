@@ -4,7 +4,6 @@ const { body, validationResult } = require('express-validator');
 const { authMiddleware } = require('../middleware/auth');
 const User = require('../models/User');
 const Transaction = require('../models/Transaction');
-const monnifyService = require('../services/monnify');
 const flutterwaveService = require('../services/flutterwave');
 const { createNotification } = require('../services/notifications');
 const { requireVerifiedKycForTransactions } = require('../middleware/kyc');
@@ -42,19 +41,15 @@ router.post('/verify-account', authMiddleware, [
     const { bankCode, accountNumber } = req.body;
     const bank = BANKS.find((item) => item.code === bankCode);
 
-    // Try Monnify first, then Flutterwave, fallback to mock
     let accountName = `${user.firstName} ${user.lastName}`;
 
-    if (monnifyService.isConfigured) {
-      const verifyResult = await monnifyService.verifyAccount(accountNumber, bankCode);
-      if (verifyResult.success) {
-        accountName = verifyResult.accountName;
-      }
-    } else if (flutterwaveService.isConfigured) {
+    if (flutterwaveService.isConfigured) {
       const verifyResult = await flutterwaveService.verifyAccount(accountNumber, bankCode);
       if (verifyResult.success) {
         accountName = verifyResult.data?.account_name || accountName;
       }
+    } else {
+      throw new AppError('Bank verification service is not configured', 503);
     }
 
     res.json({
@@ -157,26 +152,11 @@ router.post('/ngn', authMiddleware, requireVerifiedKycForTransactions, [
       bankName: BANKS.find(b => b.code === bankCode)?.name || 'Unknown'
     };
 
-    // Try to initiate transfer with bank partner
+    // Try to initiate transfer with Flutterwave
     let transferResult = null;
     let transferInitiated = false;
 
-    if (monnifyService.isConfigured) {
-      try {
-        transferResult = await monnifyService.initiateTransfer({
-          amount: amount - fee,
-          accountNumber,
-          bankCode,
-          accountName,
-          narration: 'FlameX Withdrawal',
-          reference
-        });
-        transferInitiated = transferResult?.success === true;
-      } catch (transferError) {
-        logger.error(`Monnify transfer failed: ${transferError.message}`);
-        throw new AppError('Bank transfer failed. Please try again.', 503, transferError.message);
-      }
-    } else if (flutterwaveService.isConfigured) {
+    if (flutterwaveService.isConfigured) {
       try {
         transferResult = await flutterwaveService.initiateTransfer({
           amount: amount - fee,
@@ -213,7 +193,7 @@ router.post('/ngn', authMiddleware, requireVerifiedKycForTransactions, [
       metadata: {
         bankData,
         transferReference: transferResult?.reference || transferResult?.transactionId,
-        provider: monnifyService.isConfigured ? 'monnify' : 'flutterwave'
+        provider: 'flutterwave'
       }
     });
     await transaction.save({ session });
