@@ -67,12 +67,12 @@ router.get('/address/:chainId', authMiddleware, asyncHandler(async (req, res) =>
   });
 }));
 
-// Request NGN deposit - Get virtual account
+// Request NGN deposit - Create Flutterwave checkout
 router.post('/ngn', authMiddleware, [
   body('amount').isFloat({ min: 100 }).withMessage('Minimum deposit is ₦100')
 ], asyncHandler(async (req, res) => {
   const logger = new Logger('deposit/ngn');
-  
+
   const errors = validationResult(req);
   if (!errors.isEmpty()) {
     return res.status(400).json({ errors: errors.array() });
@@ -98,43 +98,40 @@ router.post('/ngn', authMiddleware, [
     throw new AppError('Complete BVN or NIN verification before requesting an NGN deposit account', 400);
   }
 
-  let bankDetails = null;
+  let checkoutUrl = null;
   let providerResult = null;
 
   try {
     if (flutterwaveService.isConfigured) {
-      providerResult = await flutterwaveService.createVirtualAccount({
-        customerName,
+      providerResult = await flutterwaveService.createCheckout({
+        amount,
+        currency: 'NGN',
         email: user.email,
         phone: user.phone,
-        preferredBank: '044',
-        txRef: reference
+        fullName: customerName,
+        txRef: reference,
+        redirectUrl: `${process.env.FRONTEND_URL || 'http://localhost:3000'}/deposit/callback`,
+        title: 'FlameX NGN Deposit',
+        description: `Deposit ₦${amount.toLocaleString()} to your FlameX wallet`
       });
 
       if (providerResult.success) {
-        const accountData = providerResult.data || {};
-        bankDetails = {
-          bankName: accountData.bank_name || accountData.bank || 'Flutterwave',
-          bankCode: accountData.bank_code || accountData.bankCode || '044',
-          accountNumber: accountData.account_number || accountData.accountNumber || '',
-          accountName: accountData.account_name || customerName,
-          flutterwaveAccountId: accountData.id || accountData.account_number || null,
-          txRef: accountData.tx_ref || reference
-        };
+        const checkoutData = providerResult.data || {};
+        checkoutUrl = checkoutData.link || checkoutData.checkout_url || checkoutData.payment_link;
       } else {
-        logger.warn('Flutterwave virtual account creation failed', {
+        logger.warn('Flutterwave checkout creation failed', {
           userId: req.userId,
           error: providerResult.error
         });
       }
     }
   } catch (error) {
-    logger.error(`Failed to create Flutterwave virtual account: ${error.message}`);
-    throw new AppError('Failed to create bank account. Please try again.', 503);
+    logger.error(`Failed to create Flutterwave checkout: ${error.message}`);
+    throw new AppError('Failed to create payment link. Please try again.', 503);
   }
 
-  if (!bankDetails) {
-    throw new AppError(providerResult?.error || 'Bank account creation service not available', 503);
+  if (!checkoutUrl) {
+    throw new AppError(providerResult?.error || 'Payment service not available', 503);
   }
 
   // Create transaction record
@@ -143,29 +140,29 @@ router.post('/ngn', authMiddleware, [
     type: 'deposit',
     amount,
     currency: 'NGN',
-    description: 'NGN deposit via bank transfer',
+    description: 'NGN deposit via Flutterwave checkout',
     status: 'pending',
     reference,
     metadata: {
-      bankDetails,
+      checkoutUrl,
       provider: 'flutterwave',
       expiresAt: new Date(Date.now() + 30 * 60 * 1000).toISOString()
     }
   });
   await transaction.save();
 
-  logger.info(`NGN deposit requested: ${reference}, amount: ${amount}`);
+  logger.info(`NGN deposit checkout created: ${reference}, amount: ${amount}`);
 
   res.json({
     success: true,
-    message: 'Deposit account created',
+    message: 'Payment link created',
     reference,
     amount,
-    bankDetails,
+    checkoutUrl,
     expiresAt: new Date(Date.now() + 30 * 60 * 1000).toISOString(),
     instructions: [
-      `Transfer ₦${amount.toLocaleString()} to the account above`,
-      'Use the reference as the transaction narration for faster confirmation',
+      'Click the payment link to complete your deposit',
+      'You can pay with card, bank transfer, or USSD',
       'Deposit will be credited to your account once payment is confirmed'
     ]
   });
@@ -191,7 +188,62 @@ router.post('/webhooks/flutterwave', asyncHandler(async (req, res) => {
 
     logger.info(`Flutterwave webhook received: ${event}`);
 
-    // Handle successful transfer events
+    // Handle successful checkout payments
+    if (event === 'charge.completed' && data?.status === 'successful') {
+      const reference = data.tx_ref || data.txRef || data.reference;
+      const amount = Number(data.amount || 0);
+
+      // Find transaction by reference
+      const transaction = await Transaction.findOne({ reference });
+
+      if (!transaction) {
+        logger.warn(`Transaction not found for reference: ${reference}`);
+        return res.json({ success: true });
+      }
+
+      if (transaction.status === 'completed') {
+        logger.info(`Transaction already completed: ${reference}`);
+        return res.json({ success: true });
+      }
+
+      await withTransaction(async (session) => {
+        transaction.status = 'completed';
+        transaction.metadata = {
+          ...(transaction.metadata?.toObject ? transaction.metadata.toObject() : transaction.metadata || {}),
+          flutterwaveReference: data.id || data.flw_ref || reference,
+          flutterwaveId: data.id || null,
+          paymentMethod: data.payment_type || 'checkout',
+          confirmedAt: new Date().toISOString()
+        };
+        await transaction.save({ session });
+
+        const user = await User.findById(transaction.userId);
+        if (!user) {
+          throw new AppError('User not found', 404);
+        }
+
+        user.balances.NGN = (user.balances.NGN || 0) + amount;
+        await user.save({ session });
+
+        await createNotification({
+          user,
+          type: 'receive',
+          title: 'Deposit confirmed',
+          body: `Your deposit of ₦${amount.toLocaleString()} has been credited to your wallet.`,
+          data: {
+            reference,
+            amount,
+            currency: 'NGN',
+            transactionId: transaction._id
+          },
+          sendEmail: true
+        });
+      });
+
+      logger.info(`Deposit confirmed via checkout: ${reference}, amount: ${amount}, user: ${transaction.userId}`);
+    }
+
+    // Handle successful transfer events (for virtual accounts)
     if (event === 'Transfer.Complete' && data?.status === 'SUCCESSFUL') {
       const reference = data.tx_ref || data.txRef || data.reference || data.id;
       const amount = Number(data.amount || 0);
@@ -251,7 +303,7 @@ router.post('/webhooks/flutterwave', asyncHandler(async (req, res) => {
         });
       });
 
-      logger.info(`Deposit confirmed: ${reference}, amount: ${amount}, user: ${transaction.userId}`);
+      logger.info(`Deposit confirmed via transfer: ${reference}, amount: ${amount}, user: ${transaction.userId}`);
     }
 
     res.json({ status: 'success' });

@@ -169,9 +169,64 @@ class FlutterwaveService {
   }
 
   /**
-   * Create a virtual card
-   * @param {object} params - Card parameters
+   * Create a payment checkout link
+   * @param {object} params - Checkout parameters
    */
+  async createCheckout(params) {
+    if (!this.isConfigured) {
+      return { success: false, error: 'Flutterwave not configured' };
+    }
+
+    const {
+      amount,
+      currency = 'NGN',
+      email,
+      phone,
+      fullName,
+      txRef,
+      redirectUrl,
+      paymentOptions = 'card,banktransfer,ussd',
+      title = 'FlameX Deposit',
+      description = 'Deposit to FlameX wallet'
+    } = params;
+
+    if (!email || email.trim() === '') {
+      return { success: false, error: 'email is required' };
+    }
+
+    try {
+      const response = await axios.post(
+        `${this.baseUrl}/payments`,
+        {
+          tx_ref: txRef || `FLAMEX_${Date.now()}`,
+          amount,
+          currency,
+          redirect_url: redirectUrl,
+          payment_options: paymentOptions,
+          customer: {
+            email,
+            phone_number: phone,
+            name: fullName
+          },
+          customizations: {
+            title,
+            description,
+            logo: 'https://flamex.com/logo.png' // Update with actual logo URL
+          }
+        },
+        { headers: this.getHeaders() }
+      );
+
+      return {
+        success: true,
+        data: response.data.data,
+        message: response.data.message
+      };
+    } catch (error) {
+      console.error('Flutterwave checkout error:', error.response?.data || error.message);
+      return { success: false, error: error.response?.data?.message || error.message };
+    }
+  }
   async createVirtualCard(params) {
     if (!this.isConfigured) {
       return { success: false, error: 'Flutterwave not configured' };
