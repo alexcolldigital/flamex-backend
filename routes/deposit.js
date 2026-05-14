@@ -212,7 +212,7 @@ router.post('/ngn', authMiddleware, [
  * Receives payment notifications from Flutterwave
  * Path: /webhooks/flutterwave (must be registered in Flutterwave dashboard)
  */
-router.post('/webhooks/flutterwave', asyncHandler(async (req, res) => {
+async function handleFlutterwaveWebhook(req, res) {
   const logger = new Logger('deposit/webhooks/flutterwave');
   
   try {
@@ -228,7 +228,7 @@ router.post('/webhooks/flutterwave', asyncHandler(async (req, res) => {
     logger.info(`Flutterwave webhook received: ${event}`);
 
     // Handle successful checkout payments
-    if (event === 'charge.completed' && data?.status === 'successful') {
+    if (event === 'charge.completed' && data?.status?.toString().toLowerCase() === 'successful') {
       const reference = data.tx_ref || data.txRef || data.reference;
       const amount = Number(data.amount || 0);
 
@@ -350,11 +350,13 @@ router.post('/webhooks/flutterwave', asyncHandler(async (req, res) => {
     logger.error(`Webhook processing error: ${error.message}`);
     res.status(200).json({ status: 'error', message: error.message });
   }
-}));
+}
+
+router.post('/webhooks/flutterwave', asyncHandler(handleFlutterwaveWebhook));
 
 // Global error handler
 router.use((err, req, res, next) => {
   handleError(err, req, res, new Logger('deposit'));
 });
 
-module.exports = router;
+module.exports = { router, handleFlutterwaveWebhook };
