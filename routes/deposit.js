@@ -226,8 +226,19 @@ async function handleFlutterwaveWebhook(req, res) {
 
     // Verify webhook signature
     const signature = req.headers['verif-hash'];
+    logger.info('Incoming Flutterwave webhook', {
+      signature,
+      event,
+      data,
+      headers: {
+        'verif-hash': signature,
+        'user-agent': req.headers['user-agent'],
+        'content-type': req.headers['content-type']
+      }
+    });
+
     if (!signature || signature !== process.env.FLUTTERWAVE_WEBHOOK_SECRET) {
-      logger.warn('Invalid Flutterwave webhook signature');
+      logger.warn('Invalid Flutterwave webhook signature', { signature });
       return res.status(401).json({ error: 'Invalid signature' });
     }
 
