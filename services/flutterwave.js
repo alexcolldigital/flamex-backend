@@ -153,14 +153,14 @@ class FlutterwaveService {
    * Verify a transaction
    * @param {string} txRef - Transaction reference
    */
-  async verifyTransaction(txRef) {
+  async verifyTransaction(transactionId) {
     if (!this.isConfigured) {
       return { success: false, error: 'Flutterwave not configured' };
     }
 
     try {
       const response = await axios.get(
-        `${this.baseUrl}/transactions/${txRef}/verify`,
+        `${this.baseUrl}/transactions/${transactionId}/verify`,
         { headers: this.getHeaders() }
       );
 
@@ -171,6 +171,64 @@ class FlutterwaveService {
       };
     } catch (error) {
       console.error('Flutterwave verify error:', error.response?.data || error.message);
+      return { success: false, error: error.response?.data?.message || error.message };
+    }
+  }
+
+  /**
+   * Verify a transaction with merchant reference
+   * @param {string} txRef - Merchant transaction reference
+   */
+  async verifyTransactionByReference(txRef) {
+    if (!this.isConfigured) {
+      return { success: false, error: 'Flutterwave not configured' };
+    }
+
+    try {
+      const response = await axios.get(
+        `${this.baseUrl}/transactions/verify_by_reference`,
+        {
+          headers: this.getHeaders(),
+          params: { tx_ref: txRef }
+        }
+      );
+
+      return {
+        success: true,
+        data: response.data.data,
+        message: response.data.message
+      };
+    } catch (error) {
+      console.error('Flutterwave verify by reference error:', error.response?.data || error.message);
+      return { success: false, error: error.response?.data?.message || error.message };
+    }
+  }
+
+  /**
+   * List transactions by merchant reference
+   * @param {string} txRef - Merchant transaction reference
+   */
+  async getTransactionsByReference(txRef) {
+    if (!this.isConfigured) {
+      return { success: false, error: 'Flutterwave not configured' };
+    }
+
+    try {
+      const response = await axios.get(
+        `${this.baseUrl}/transactions`,
+        {
+          headers: this.getHeaders(),
+          params: { tx_ref: txRef }
+        }
+      );
+
+      return {
+        success: true,
+        data: response.data.data,
+        message: response.data.message
+      };
+    } catch (error) {
+      console.error('Flutterwave list transactions error:', error.response?.data || error.message);
       return { success: false, error: error.response?.data?.message || error.message };
     }
   }
