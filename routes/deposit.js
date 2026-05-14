@@ -125,6 +125,76 @@ async function creditNgnDeposit({
   return user;
 }
 
+async function reconcilePendingDepositsForUser(userId, { limit = 5 } = {}) {
+  if (!flutterwaveService.isConfigured) {
+    return { checked: 0, credited: 0 };
+  }
+
+  const pendingTransactions = await Transaction.find({
+    userId,
+    type: 'deposit',
+    currency: 'NGN',
+    status: 'pending',
+    'metadata.provider': 'flutterwave',
+    createdAt: { $gte: new Date(Date.now() - 48 * 60 * 60 * 1000) }
+  })
+    .sort({ createdAt: -1 })
+    .limit(limit);
+
+  let credited = 0;
+
+  for (const pendingTransaction of pendingTransactions) {
+    const metadata = getTransactionMetadata(pendingTransaction);
+    const transactionId = metadata.flutterwaveId ? Number(metadata.flutterwaveId) : null;
+    const verification = await verifyFlutterwaveDeposit(pendingTransaction.reference, transactionId);
+
+    if (!verification.success) {
+      continue;
+    }
+
+    const providerData = verification.data || {};
+    const verifiedAmount = Number(providerData.amount || providerData.charged_amount || 0);
+    const verifiedCurrency = String(providerData.currency || '').toUpperCase();
+    const verifiedReference =
+      providerData.tx_ref ||
+      providerData.txRef ||
+      pendingTransaction.reference;
+
+    if (
+      !isSuccessfulFlutterwaveStatus(providerData.status) ||
+      verifiedCurrency !== 'NGN' ||
+      verifiedReference !== pendingTransaction.reference ||
+      verifiedAmount < Number(pendingTransaction.amount || 0)
+    ) {
+      continue;
+    }
+
+    const creditedUser = await withTransaction(async (session) => {
+      const transactionInSession = await Transaction.findById(pendingTransaction._id).session(session);
+      if (!transactionInSession || transactionInSession.status === 'completed') {
+        return null;
+      }
+
+      return creditNgnDeposit({
+        transaction: transactionInSession,
+        amount: transactionInSession.amount,
+        providerData,
+        paymentMethod: providerData.payment_type || metadata.depositMethod || 'checkout',
+        session
+      });
+    });
+
+    if (creditedUser) {
+      credited += 1;
+    }
+  }
+
+  return {
+    checked: pendingTransactions.length,
+    credited
+  };
+}
+
 // Get deposit address for crypto
 router.get('/address/:chainId', authMiddleware, asyncHandler(async (req, res) => {
   const logger = new Logger('deposit/address');
@@ -530,4 +600,4 @@ router.use((err, req, res, next) => {
   handleError(err, req, res, new Logger('deposit'));
 });
 
-module.exports = { router, handleFlutterwaveWebhook };
+module.exports = { router, handleFlutterwaveWebhook, reconcilePendingDepositsForUser };

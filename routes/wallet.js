@@ -4,6 +4,7 @@ const { authMiddleware } = require('../middleware/auth');
 const User = require('../models/User');
 const Transaction = require('../models/Transaction');
 const { decrypt } = require('../utils/encryption');
+const { reconcilePendingDepositsForUser } = require('./deposit');
 
 const CHAIN_METADATA = [
   { id: 'solana', name: 'Solana', symbol: 'SOL', color: '#9945FF', explorerBaseUrl: 'https://solscan.io/account/' },
@@ -75,6 +76,7 @@ function buildWalletSummary(user) {
 // Get wallet summary
 router.get('/', authMiddleware, async (req, res) => {
   try {
+    await reconcilePendingDepositsForUser(req.userId);
     const user = await User.findById(req.userId);
     res.json(buildWalletSummary(user));
   } catch (error) {
@@ -84,6 +86,7 @@ router.get('/', authMiddleware, async (req, res) => {
 
 router.get('/summary', authMiddleware, async (req, res) => {
   try {
+    await reconcilePendingDepositsForUser(req.userId);
     const user = await User.findById(req.userId);
     res.json(buildWalletSummary(user));
   } catch (error) {
@@ -94,6 +97,7 @@ router.get('/summary', authMiddleware, async (req, res) => {
 // Get balances
 router.get('/balances', authMiddleware, async (req, res) => {
   try {
+    await reconcilePendingDepositsForUser(req.userId);
     const user = await User.findById(req.userId);
     const walletsByChain = {};
 
