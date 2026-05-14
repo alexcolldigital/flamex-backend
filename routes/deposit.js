@@ -106,6 +106,7 @@ router.post('/ngn', authMiddleware, [
   try {
     if (flutterwaveService.isConfigured) {
       if (method === 'checkout') {
+        const callbackHost = process.env.FRONTEND_URL || process.env.APP_URL || 'https://flamex.app';
         providerResult = await flutterwaveService.createCheckout({
           amount,
           currency: 'NGN',
@@ -113,7 +114,7 @@ router.post('/ngn', authMiddleware, [
           phone: user.phone,
           fullName: customerName,
           txRef: reference,
-          redirectUrl: `${process.env.FRONTEND_URL || 'http://localhost:3000'}/deposit/callback`,
+          redirectUrl: `${callbackHost}/deposit/callback`,
           title: 'FlameX NGN Deposit',
           description: `Deposit ₦${amount.toLocaleString()} to your FlameX wallet`
         });
@@ -122,7 +123,12 @@ router.post('/ngn', authMiddleware, [
           const checkoutData = providerResult.data || {};
           result = {
             method: 'checkout',
-            checkoutUrl: checkoutData.link || checkoutData.checkout_url || checkoutData.payment_link,
+            checkoutUrl:
+              checkoutData.link ||
+              checkoutData.checkout_url ||
+              checkoutData.payment_link ||
+              checkoutData.meta?.authorization?.redirect ||
+              checkoutData.authorization?.redirect,
             instructions: [
               'Click the payment link to complete your deposit',
               'You can pay with card, bank transfer, or USSD',

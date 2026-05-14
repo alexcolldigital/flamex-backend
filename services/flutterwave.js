@@ -107,7 +107,14 @@ class FlutterwaveService {
       };
     } catch (error) {
       console.error('Flutterwave charge error:', error.response?.data || error.message);
-      return { success: false, error: error.response?.data?.message || error.message };
+      return {
+        success: false,
+        error:
+          error.response?.data?.message ||
+          error.response?.data?.status ||
+          error.response?.data?.status_message ||
+          error.message
+      };
     }
   }
 
@@ -224,7 +231,14 @@ class FlutterwaveService {
       };
     } catch (error) {
       console.error('Flutterwave checkout error:', error.response?.data || error.message);
-      return { success: false, error: error.response?.data?.message || error.message };
+      return {
+        success: false,
+        error:
+          error.response?.data?.message ||
+          error.response?.data?.status ||
+          error.response?.data?.status_message ||
+          error.message
+      };
     }
   }
   async createVirtualCard(params) {
