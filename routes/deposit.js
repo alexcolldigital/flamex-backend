@@ -65,7 +65,45 @@ async function verifyFlutterwaveDeposit(reference, transactionId = null) {
     }
   }
 
-  return flutterwaveService.verifyTransactionByReference(reference);
+  const byReferenceResult = await flutterwaveService.verifyTransactionByReference(reference);
+  if (byReferenceResult.success) {
+    return byReferenceResult;
+  }
+
+  const transactionsResult = await flutterwaveService.getTransactionsByReference(reference);
+  if (!transactionsResult.success) {
+    return byReferenceResult;
+  }
+
+  const transactionList = Array.isArray(transactionsResult.data)
+    ? transactionsResult.data
+    : Array.isArray(transactionsResult.data?.data)
+      ? transactionsResult.data.data
+      : [];
+
+  const matchingTransaction = transactionList.find((item) => {
+    const itemReference = item?.tx_ref || item?.txRef || item?.reference;
+    return itemReference === reference && item?.id;
+  });
+
+  if (!matchingTransaction?.id) {
+    return byReferenceResult;
+  }
+
+  return flutterwaveService.verifyTransaction(matchingTransaction.id);
+}
+
+function buildDepositRedirectUrl(req, params = {}) {
+  const frontendBase = process.env.FRONTEND_URL || process.env.APP_URL || 'https://flamex.app';
+  const url = new URL('/deposit/callback', frontendBase.endsWith('/') ? frontendBase : `${frontendBase}/`);
+
+  Object.entries(params).forEach(([key, value]) => {
+    if (value !== undefined && value !== null && value !== '') {
+      url.searchParams.set(key, String(value));
+    }
+  });
+
+  return url.toString();
 }
 
 async function creditNgnDeposit({
@@ -262,7 +300,7 @@ router.post('/ngn', authMiddleware, [
   try {
     if (flutterwaveService.isConfigured) {
       if (method === 'checkout') {
-        const callbackHost = process.env.FRONTEND_URL || process.env.APP_URL || 'https://flamex.app';
+        const apiBase = process.env.API_URL || process.env.APP_URL || `${req.protocol}://${req.get('host')}`;
         providerResult = await flutterwaveService.createCheckout({
           amount,
           currency: 'NGN',
@@ -270,7 +308,7 @@ router.post('/ngn', authMiddleware, [
           phone: user.phone,
           fullName: customerName,
           txRef: reference,
-          redirectUrl: `${callbackHost}/deposit/callback`,
+          redirectUrl: `${apiBase.replace(/\/$/, '')}/api/deposit/callback`,
           title: 'FlameX NGN Deposit',
           description: `Deposit NGN ${amount.toLocaleString()} to your FlameX wallet`
         });
@@ -466,6 +504,90 @@ router.post('/verify', authMiddleware, [
     amount: transaction.amount,
     balances: user?.balances || null
   });
+}));
+
+router.get('/callback', asyncHandler(async (req, res) => {
+  const logger = new Logger('deposit/callback');
+  const reference = String(req.query.tx_ref || req.query.reference || '').trim();
+  const transactionId = req.query.transaction_id ? Number(req.query.transaction_id) : null;
+  const status = String(req.query.status || '').trim().toLowerCase();
+
+  if (!reference) {
+    return res.redirect(buildDepositRedirectUrl(req, {
+      status: 'failed',
+      reason: 'missing_reference'
+    }));
+  }
+
+  const transaction = await Transaction.findOne({ reference, type: 'deposit' });
+  if (!transaction) {
+    return res.redirect(buildDepositRedirectUrl(req, {
+      status: 'failed',
+      reference,
+      reason: 'transaction_not_found'
+    }));
+  }
+
+  if (status !== 'successful' && status !== 'completed') {
+    return res.redirect(buildDepositRedirectUrl(req, {
+      status: status || 'cancelled',
+      reference
+    }));
+  }
+
+  const verification = await verifyFlutterwaveDeposit(reference, transactionId);
+  if (!verification.success) {
+    logger.warn('Flutterwave callback verification failed', {
+      reference,
+      transactionId,
+      error: verification.error
+    });
+
+    return res.redirect(buildDepositRedirectUrl(req, {
+      status: 'pending',
+      reference,
+      reason: 'verification_failed'
+    }));
+  }
+
+  const providerData = verification.data || {};
+  const verifiedAmount = Number(providerData.amount || providerData.charged_amount || 0);
+  const verifiedCurrency = String(providerData.currency || '').toUpperCase();
+  const verifiedReference = providerData.tx_ref || providerData.txRef || reference;
+
+  if (
+    !isSuccessfulFlutterwaveStatus(providerData.status) ||
+    verifiedCurrency !== 'NGN' ||
+    verifiedReference !== reference ||
+    verifiedAmount < Number(transaction.amount || 0)
+  ) {
+    return res.redirect(buildDepositRedirectUrl(req, {
+      status: 'pending',
+      reference,
+      reason: 'verification_checks_failed'
+    }));
+  }
+
+  await withTransaction(async (session) => {
+    const transactionInSession = await Transaction.findById(transaction._id).session(session);
+    if (!transactionInSession || transactionInSession.status === 'completed') {
+      return;
+    }
+
+    await creditNgnDeposit({
+      transaction: transactionInSession,
+      amount: transactionInSession.amount,
+      providerData,
+      paymentMethod: providerData.payment_type || 'checkout',
+      session
+    });
+  });
+
+  return res.redirect(buildDepositRedirectUrl(req, {
+    status: 'successful',
+    reference,
+    amount: transaction.amount
+  }));
 }));
 
 /**
