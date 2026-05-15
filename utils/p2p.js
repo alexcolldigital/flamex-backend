@@ -1,4 +1,5 @@
 const SUPPORTED_P2P_ASSETS = ['USDT', 'USDC', 'SOL', 'ETH', 'BNB', 'FLAME'];
+const SUPPORTED_P2P_PAYMENT_METHODS = ['bank_transfer'];
 
 function normalizeAsset(asset) {
   return String(asset || '').trim().toUpperCase();
@@ -6,6 +7,10 @@ function normalizeAsset(asset) {
 
 function ensureSupportedAsset(asset) {
   return SUPPORTED_P2P_ASSETS.includes(normalizeAsset(asset));
+}
+
+function ensureSupportedPaymentMethod(paymentMethod) {
+  return SUPPORTED_P2P_PAYMENT_METHODS.includes(String(paymentMethod || '').trim().toLowerCase());
 }
 
 function ensureLockedBalances(user) {
@@ -21,6 +26,11 @@ function getBalance(user, asset) {
 function getLockedBalance(user, asset) {
   ensureLockedBalances(user);
   return Number(user?.lockedBalances?.[asset] || 0);
+}
+
+function getAvailableBalance(user, asset) {
+  const normalized = normalizeAsset(asset);
+  return Math.max(0, getBalance(user, normalized) - getLockedBalance(user, normalized));
 }
 
 function lockFunds(user, asset, amount) {
@@ -90,10 +100,13 @@ function isP2PAdmin(user) {
 
 module.exports = {
   SUPPORTED_P2P_ASSETS,
+  SUPPORTED_P2P_PAYMENT_METHODS,
   normalizeAsset,
   ensureSupportedAsset,
+  ensureSupportedPaymentMethod,
   getBalance,
   getLockedBalance,
+  getAvailableBalance,
   lockFunds,
   unlockFunds,
   releaseLockedFunds,

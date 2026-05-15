@@ -23,6 +23,39 @@ const BANKS = [
   { id: '214', name: 'FCMB', code: '214' }
 ];
 
+function getAvailableBalance(user, currency) {
+  const currencyUpper = String(currency || '').toUpperCase();
+  const balance = Number(user?.balances?.[currencyUpper] || 0);
+  const locked = Number(user?.lockedBalances?.[currencyUpper] || 0);
+  return Math.max(0, balance - locked);
+}
+
+async function refundFailedWithdrawal({ userId, transactionId, amount, failureReason }) {
+  await withTransaction(async (session) => {
+    const [sessionUser, sessionTransaction] = await Promise.all([
+      User.findById(userId).session(session),
+      Transaction.findById(transactionId).session(session)
+    ]);
+
+    if (!sessionUser || !sessionTransaction) {
+      throw new AppError('Unable to reverse failed withdrawal cleanly', 500);
+    }
+
+    const currency = sessionTransaction.currency || 'NGN';
+    sessionUser.balances[currency] = Number((Number(sessionUser.balances[currency] || 0) + Number(amount)).toFixed(currency === 'NGN' ? 2 : 8));
+    sessionTransaction.status = 'failed';
+    sessionTransaction.metadata = {
+      ...(sessionTransaction.metadata?.toObject?.() || sessionTransaction.metadata || {}),
+      failureReason
+    };
+
+    await Promise.all([
+      sessionUser.save({ session }),
+      sessionTransaction.save({ session })
+    ]);
+  });
+}
+
 router.get('/banks', authMiddleware, async (req, res) => {
   res.json({ banks: BANKS });
 });
@@ -30,44 +63,41 @@ router.get('/banks', authMiddleware, async (req, res) => {
 router.post('/verify-account', authMiddleware, [
   body('bankCode').notEmpty(),
   body('accountNumber').isLength({ min: 10, max: 10 })
-], async (req, res) => {
-  try {
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) {
-      return res.status(400).json({ errors: errors.array() });
-    }
-
-    const user = await User.findById(req.userId);
-    const { bankCode, accountNumber } = req.body;
-    const bank = BANKS.find((item) => item.code === bankCode);
-
-    let accountName = `${user.firstName} ${user.lastName}`;
-
-    if (flutterwaveService.isConfigured) {
-      const verifyResult = await flutterwaveService.verifyAccount(accountNumber, bankCode);
-      if (verifyResult.success) {
-        accountName = verifyResult.data?.account_name || accountName;
-      }
-    } else {
-      throw new AppError('Bank verification service is not configured', 503);
-    }
-
-    res.json({
-      accountName,
-      accountNumber,
-      bankName: bank?.name || 'Unknown Bank'
-    });
-  } catch (error) {
-    res.status(500).json({ message: 'Server error' });
+], asyncHandler(async (req, res) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) {
+    return res.status(400).json({ errors: errors.array() });
   }
-});
 
-// NGN Withdrawal - Request OTP
+  const user = await User.findById(req.userId);
+  const { bankCode, accountNumber } = req.body;
+  const bank = BANKS.find((item) => item.code === bankCode);
+
+  let accountName = `${user.firstName} ${user.lastName}`;
+
+  if (!flutterwaveService.isConfigured) {
+    throw new AppError('Bank verification service is not configured', 503);
+  }
+
+  const verifyResult = await flutterwaveService.verifyAccount(accountNumber, bankCode);
+  if (!verifyResult.success) {
+    throw new AppError(verifyResult.error || 'Unable to verify bank account', 502);
+  }
+
+  accountName = verifyResult.data?.account_name || accountName;
+
+  res.json({
+    accountName,
+    accountNumber,
+    bankName: bank?.name || 'Unknown Bank'
+  });
+}));
+
 router.post('/ngn/request-otp', authMiddleware, requireVerifiedKycForTransactions, [
   body('amount').isFloat({ min: 500 })
 ], asyncHandler(async (req, res) => {
   const logger = new Logger('withdrawal/ngn/request-otp');
-  
+
   const errors = validationResult(req);
   if (!errors.isEmpty()) {
     return res.status(400).json({ errors: errors.array() });
@@ -76,16 +106,14 @@ router.post('/ngn/request-otp', authMiddleware, requireVerifiedKycForTransaction
   const amount = Number(req.body.amount);
   const user = await User.findById(req.userId);
 
-  if (user.balances.NGN < amount) {
+  if (getAvailableBalance(user, 'NGN') < amount) {
     throw new AppError('Insufficient balance', 400);
   }
 
   if (!requires2FA(user, amount)) {
-    // No 2FA required, return success
     return res.json({ requiresOTP: false });
   }
 
-  // Generate and send OTP
   const otp = await storeOTP(user, 'withdrawal');
   await sendOTPEmail(user, otp, 'withdrawal');
 
@@ -96,7 +124,6 @@ router.post('/ngn/request-otp', authMiddleware, requireVerifiedKycForTransaction
   });
 }));
 
-// NGN Withdrawal - Confirm with OTP and initiate transfer
 router.post('/ngn', authMiddleware, requireVerifiedKycForTransactions, [
   body('amount').isFloat({ min: 500 }),
   body('bankCode').notEmpty().withMessage('Bank code required'),
@@ -115,18 +142,15 @@ router.post('/ngn', authMiddleware, requireVerifiedKycForTransactions, [
   const { bankCode, accountNumber, accountName, pin, otp } = req.body;
   let user = await User.findById(req.userId);
 
-  // Verify PIN
   const pinMatch = await user.comparePin(pin);
   if (!pinMatch) {
     throw new AppError('Invalid PIN', 400);
   }
 
-  // Check balance (before checking OTP, so frontend can decide)
-  if (user.balances.NGN < amount) {
-    throw new AppError('Insufficient balance', 400);
+  if (getAvailableBalance(user, 'NGN') < amount) {
+    throw new AppError('Insufficient available balance', 400);
   }
 
-  // Verify 2FA if required
   if (requires2FA(user, amount)) {
     if (!otp) {
       return res.status(202).json({
@@ -135,110 +159,146 @@ router.post('/ngn', authMiddleware, requireVerifiedKycForTransactions, [
         requiresOTP: true
       });
     }
-    
+
     await verifyOTP(user, otp, 'withdrawal');
-    user = await User.findById(req.userId); // Refresh user after OTP verification
+    user = await User.findById(req.userId);
   }
 
   const fee = amount < 10000 ? 50 : 0;
+  if (amount <= fee) {
+    throw new AppError('Withdrawal amount must be greater than the fee', 400);
+  }
+
   const reference = `WD-NGN-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+  const bankData = {
+    bankCode,
+    accountNumber,
+    accountName,
+    bankName: BANKS.find((b) => b.code === bankCode)?.name || 'Unknown'
+  };
 
-  // Use transaction to ensure atomicity
-  return withTransaction(async (session) => {
-    const bankData = {
-      bankCode,
-      accountNumber,
-      accountName,
-      bankName: BANKS.find(b => b.code === bankCode)?.name || 'Unknown'
-    };
-
-    // Try to initiate transfer with Flutterwave
-    let transferResult = null;
-    let transferInitiated = false;
-
-    if (flutterwaveService.isConfigured) {
-      try {
-        transferResult = await flutterwaveService.initiateTransfer({
-          amount: amount - fee,
-          accountNumber,
-          bankCode,
-          accountName,
-          narration: 'FlameX Withdrawal',
-          reference
-        });
-        transferInitiated = transferResult?.success === true;
-      } catch (transferError) {
-        logger.error(`Flutterwave transfer failed: ${transferError.message}`);
-        throw new AppError('Bank transfer failed. Please try again.', 503, transferError.message);
-      }
-    } else {
-      throw new AppError('Bank transfer service not configured', 503);
+  const debitResult = await withTransaction(async (session) => {
+    const sessionUser = await User.findById(user._id).session(session);
+    if (!sessionUser) {
+      throw new AppError('User not found', 404);
     }
 
-    // Only deduct balance after successful bank transfer initiation
-    if (!transferInitiated) {
-      throw new AppError('Failed to initiate bank transfer', 503);
+    if (getAvailableBalance(sessionUser, 'NGN') < amount) {
+      throw new AppError('Insufficient available balance', 400);
     }
 
-    // Create transaction record
     const transaction = new Transaction({
-      userId: req.userId,
+      userId: sessionUser._id,
       type: 'withdrawal',
       amount,
       currency: 'NGN',
       description: `Withdrawal to ${accountName} (${bankData.bankName})`,
-      status: 'pending',
+      status: 'processing',
       fee,
       reference,
       metadata: {
         bankData,
-        transferReference: transferResult?.reference || transferResult?.transactionId,
-        provider: 'flutterwave'
+        provider: 'flutterwave',
+        netAmount: amount - fee
       }
     });
-    await transaction.save({ session });
 
-    // Deduct balance (atomically within transaction)
-    user.balances.NGN -= amount;
-    await user.save({ session });
+    sessionUser.balances.NGN = Number((Number(sessionUser.balances.NGN || 0) - amount).toFixed(2));
 
-    // Send notification
-    await createNotification({
-      user,
-      type: 'send',
-      title: 'NGN withdrawal initiated',
-      body: `Your withdrawal of ₦${amount.toLocaleString()} to ${accountName} has been initiated.`,
-      data: {
-        reference,
-        amount,
-        fee,
-        currency: 'NGN',
-        transactionId: transaction._id,
-        status: 'pending'
-      },
-      sendEmail: true
+    await Promise.all([
+      transaction.save({ session }),
+      sessionUser.save({ session })
+    ]);
+
+    return {
+      userId: sessionUser._id,
+      transactionId: transaction._id,
+      newBalance: sessionUser.balances.NGN
+    };
+  });
+
+  if (!flutterwaveService.isConfigured) {
+    await refundFailedWithdrawal({
+      userId: debitResult.userId,
+      transactionId: debitResult.transactionId,
+      amount,
+      failureReason: 'Bank transfer service not configured'
     });
+    throw new AppError('Bank transfer service not configured', 503);
+  }
 
-    logger.info(`NGN withdrawal initiated: ${reference}, amount: ${amount}`);
-
-    res.json({
-      success: true,
-      message: 'Withdrawal initiated successfully',
-      reference,
+  let transferResult;
+  try {
+    transferResult = await flutterwaveService.initiateTransfer({
       amount: amount - fee,
-      fee,
-      newBalance: user.balances.NGN,
-      transactionId: transaction._id
+      accountNumber,
+      bankCode,
+      accountName,
+      narration: 'FlameX Withdrawal',
+      reference
     });
+  } catch (transferError) {
+    logger.error(`Flutterwave transfer failed: ${transferError.message}`);
+    transferResult = { success: false, error: transferError.message };
+  }
+
+  if (!transferResult?.success) {
+    await refundFailedWithdrawal({
+      userId: debitResult.userId,
+      transactionId: debitResult.transactionId,
+      amount,
+      failureReason: transferResult?.error || 'Failed to initiate bank transfer'
+    });
+    throw new AppError(transferResult?.error || 'Failed to initiate bank transfer', 503);
+  }
+
+  const transaction = await Transaction.findByIdAndUpdate(
+    debitResult.transactionId,
+    {
+      $set: {
+        status: 'pending',
+        'metadata.transferReference': transferResult?.data?.reference || transferResult?.data?.id || null,
+        'metadata.providerResponse': transferResult?.data || null
+      }
+    },
+    { new: true }
+  );
+
+  const notificationUser = await User.findById(debitResult.userId);
+  await createNotification({
+    user: notificationUser,
+    type: 'send',
+    title: 'NGN withdrawal initiated',
+    body: `Your withdrawal of NGN ${amount.toLocaleString()} to ${accountName} has been initiated.`,
+    data: {
+      reference,
+      amount,
+      fee,
+      currency: 'NGN',
+      transactionId: transaction._id,
+      status: 'pending'
+    },
+    sendEmail: true
+  });
+
+  logger.info(`NGN withdrawal initiated: ${reference}, amount: ${amount}`);
+
+  res.json({
+    success: true,
+    message: 'Withdrawal initiated successfully',
+    reference,
+    amount: amount - fee,
+    fee,
+    newBalance: debitResult.newBalance,
+    transactionId: transaction._id
   });
 }));
 
-// Crypto Withdrawal - Request OTP
 router.post('/crypto/request-otp', authMiddleware, requireVerifiedKycForTransactions, [
   body('amount').isFloat({ min: 0.000001 })
 ], asyncHandler(async (req, res) => {
   const logger = new Logger('withdrawal/crypto/request-otp');
-  
+
   const errors = validationResult(req);
   if (!errors.isEmpty()) {
     return res.status(400).json({ errors: errors.array() });
@@ -247,7 +307,6 @@ router.post('/crypto/request-otp', authMiddleware, requireVerifiedKycForTransact
   const amount = Number(req.body.amount);
   const user = await User.findById(req.userId);
 
-  // For crypto, always require 2FA if large amount
   if (!requires2FA(user, amount)) {
     return res.json({ requiresOTP: false });
   }
@@ -262,7 +321,6 @@ router.post('/crypto/request-otp', authMiddleware, requireVerifiedKycForTransact
   });
 }));
 
-// Crypto Withdrawal - Confirm and execute
 router.post('/crypto', authMiddleware, requireVerifiedKycForTransactions, [
   body('chainId').notEmpty().withMessage('Chain ID required'),
   body('token').notEmpty().withMessage('Token required'),
@@ -273,7 +331,7 @@ router.post('/crypto', authMiddleware, requireVerifiedKycForTransactions, [
   body('otp').optional().isString()
 ], asyncHandler(async (req, res) => {
   const logger = new Logger('withdrawal/crypto');
-  
+
   const errors = validationResult(req);
   if (!errors.isEmpty()) {
     return res.status(400).json({ errors: errors.array() });
@@ -283,30 +341,26 @@ router.post('/crypto', authMiddleware, requireVerifiedKycForTransactions, [
   const gasFeeEstimate = Number(req.body.gasFeeEstimate || 0);
   const { chainId, token, toAddress, pin, otp } = req.body;
   const tokenUpper = token.toUpperCase();
-  
+
   let user = await User.findById(req.userId);
 
-  // Verify PIN
   const pinMatch = await user.comparePin(pin);
   if (!pinMatch) {
     throw new AppError('Invalid PIN', 400);
   }
 
-  // Validate balance including gas fee
   const totalAmount = amount + gasFeeEstimate;
-  const balance = user.balances[tokenUpper] || 0;
+  const balance = Number(user.balances[tokenUpper] || 0);
   if (balance < totalAmount) {
     throw new AppError(`Insufficient ${tokenUpper} balance. Required: ${totalAmount}, Available: ${balance}`, 400);
   }
 
-  // Check for locked balances (P2P escrow)
-  const lockedAmount = user.lockedBalances?.[tokenUpper] || 0;
+  const lockedAmount = Number(user.lockedBalances?.[tokenUpper] || 0);
   const availableAfterLock = balance - lockedAmount;
   if (availableAfterLock < totalAmount) {
     throw new AppError(`Insufficient available ${tokenUpper} balance. Available: ${availableAfterLock}, Required: ${totalAmount}`, 400);
   }
 
-  // Verify 2FA if required
   if (requires2FA(user, amount)) {
     if (!otp) {
       return res.status(202).json({
@@ -315,42 +369,59 @@ router.post('/crypto', authMiddleware, requireVerifiedKycForTransactions, [
         requiresOTP: true
       });
     }
-    
+
     await verifyOTP(user, otp, 'withdrawal');
     user = await User.findById(req.userId);
   }
 
   const reference = `WD-CRP-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
 
-  // Create transaction with gas fee tracking
-  const transaction = new Transaction({
-    userId: req.userId,
-    type: 'withdrawal',
-    amount,
-    currency: tokenUpper,
-    chainId,
-    description: `${tokenUpper} withdrawal to ${toAddress.substring(0, 10)}...`,
-    status: 'pending',
-    gasFee: gasFeeEstimate,
-    reference,
-    metadata: {
-      toAddress,
-      chainId,
-      gasFeeEstimate
+  const { transaction, updatedUser } = await withTransaction(async (session) => {
+    const sessionUser = await User.findById(user._id).session(session);
+    if (!sessionUser) {
+      throw new AppError('User not found', 404);
     }
+
+    const sessionBalance = Number(sessionUser.balances[tokenUpper] || 0);
+    const sessionLockedAmount = Number(sessionUser.lockedBalances?.[tokenUpper] || 0);
+    const sessionAvailableAfterLock = sessionBalance - sessionLockedAmount;
+    if (sessionAvailableAfterLock < totalAmount) {
+      throw new AppError(`Insufficient available ${tokenUpper} balance. Available: ${sessionAvailableAfterLock}, Required: ${totalAmount}`, 400);
+    }
+
+    const sessionTransaction = new Transaction({
+      userId: req.userId,
+      type: 'withdrawal',
+      amount,
+      currency: tokenUpper,
+      chainId,
+      description: `${tokenUpper} withdrawal to ${toAddress.substring(0, 10)}...`,
+      status: 'pending',
+      gasFee: gasFeeEstimate,
+      reference,
+      metadata: {
+        toAddress,
+        chainId,
+        gasFeeEstimate,
+        executionMode: 'manual_or_provider_pending'
+      }
+    });
+
+    sessionUser.balances[tokenUpper] = Number((sessionBalance - totalAmount).toFixed(8));
+
+    await Promise.all([
+      sessionTransaction.save({ session }),
+      sessionUser.save({ session })
+    ]);
+
+    return { transaction: sessionTransaction, updatedUser: sessionUser };
   });
-  await transaction.save();
 
-  // Deduct balance and gas fee
-  user.balances[tokenUpper] -= (amount + gasFeeEstimate);
-  await user.save();
-
-  // Send notification
   await createNotification({
-    user,
+    user: updatedUser,
     type: 'send',
     title: 'Crypto withdrawal initiated',
-    body: `Your ${tokenUpper} withdrawal of ${amount} to ${toAddress.substring(0, 10)}... has been initiated.${gasFeeEstimate > 0 ? ` Network fee: ${gasFeeEstimate}` : ''}`,
+    body: `Your ${tokenUpper} withdrawal of ${amount} to ${toAddress.substring(0, 10)}... has been queued for processing.${gasFeeEstimate > 0 ? ` Network fee: ${gasFeeEstimate}` : ''}`,
     data: {
       reference,
       amount,
@@ -372,13 +443,12 @@ router.post('/crypto', authMiddleware, requireVerifiedKycForTransactions, [
     reference,
     amount,
     gasFee: gasFeeEstimate,
-    newBalance: user.balances[tokenUpper],
+    newBalance: updatedUser.balances[tokenUpper],
     transactionId: transaction._id
   });
 }));
 
-// Global error handler for this router
-router.use((err, req, res, next) => {
+router.use((err, req, res, _next) => {
   handleError(err, req, res, new Logger('withdrawal'));
 });
 

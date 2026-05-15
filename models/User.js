@@ -91,6 +91,26 @@ const userSchema = new mongoose.Schema({
     accountName: { type: String },
     isDefault: { type: Boolean, default: false }
   }],
+
+  p2pProfile: {
+    isMerchant: { type: Boolean, default: false },
+    merchantStatus: {
+      type: String,
+      enum: ['none', 'pending', 'approved', 'suspended'],
+      default: 'none'
+    },
+    preferredFiatCurrency: { type: String, default: 'NGN' },
+    region: { type: String, default: 'NG' },
+    completionRate: { type: Number, default: 0 },
+    totalTrades: { type: Number, default: 0 },
+    completedTrades: { type: Number, default: 0 },
+    cancelledTrades: { type: Number, default: 0 },
+    disputedTrades: { type: Number, default: 0 },
+    totalVolumeNgn: { type: Number, default: 0 },
+    securityDeposit: { type: Number, default: 0 },
+    averageReleaseMinutes: { type: Number, default: 0 },
+    lastTradeAt: { type: Date, default: null }
+  },
   
   settings: {
     currency: { type: String, default: 'NGN' },

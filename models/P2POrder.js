@@ -20,6 +20,16 @@ const paymentSnapshotSchema = new mongoose.Schema(
   { _id: false }
 );
 
+const orderMessageSchema = new mongoose.Schema(
+  {
+    senderUserId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+    senderLabel: { type: String, default: null },
+    message: { type: String, required: true },
+    createdAt: { type: Date, default: Date.now }
+  },
+  { _id: false }
+);
+
 const p2pOrderSchema = new mongoose.Schema({
   offerId: { type: mongoose.Schema.Types.ObjectId, ref: 'P2POffer', required: true, index: true },
   offerOwnerId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
@@ -33,17 +43,22 @@ const p2pOrderSchema = new mongoose.Schema({
   seller: { type: participantSchema, required: true },
   escrowUserId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
   paymentMethod: { type: String, default: 'bank_transfer' },
+  paymentMethods: { type: [String], default: ['bank_transfer'] },
   paymentSnapshot: { type: paymentSnapshotSchema, default: () => ({}) },
   status: {
     type: String,
-    enum: ['awaiting_payment', 'payment_sent', 'completed', 'cancelled', 'disputed', 'expired'],
+    enum: ['awaiting_payment', 'awaiting_release', 'payment_sent', 'completed', 'cancelled', 'disputed', 'expired'],
     default: 'awaiting_payment',
     index: true
   },
+  escrowLockedAt: { type: Date, default: Date.now },
   paymentProofNote: { type: String, default: null },
   paymentProofUrl: { type: String, default: null },
   paymentMarkedAt: { type: Date, default: null },
+  paymentDeadlineAt: { type: Date, required: true },
+  releaseDeadlineAt: { type: Date, default: null },
   releaseNote: { type: String, default: null },
+  paymentConfirmedAt: { type: Date, default: null },
   cryptoFeeAmount: { type: Number, default: 0, min: 0 },
   cryptoReleaseAmount: { type: Number, default: 0, min: 0 },
   fiatFeeAmount: { type: Number, default: 0, min: 0 },
@@ -52,6 +67,7 @@ const p2pOrderSchema = new mongoose.Schema({
   cancelledByUserId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
   cancelReason: { type: String, default: null },
   disputeId: { type: mongoose.Schema.Types.ObjectId, ref: 'P2PDispute', default: null },
+  messages: { type: [orderMessageSchema], default: [] },
   reference: { type: String, required: true, unique: true },
   createdAt: { type: Date, default: Date.now },
   updatedAt: { type: Date, default: Date.now }

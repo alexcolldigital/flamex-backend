@@ -5,6 +5,9 @@ const User = require('../models/User');
 const Transaction = require('../models/Transaction');
 const { decrypt } = require('../utils/encryption');
 const { reconcilePendingDepositsForUser } = require('./deposit');
+const flutterwaveService = require('../services/flutterwave');
+const { withTransaction } = require('../utils/database');
+const { AppError } = require('../utils/errorHandler');
 
 const CHAIN_METADATA = [
   { id: 'solana', name: 'Solana', symbol: 'SOL', color: '#9945FF', explorerBaseUrl: 'https://solscan.io/account/' },
@@ -237,6 +240,24 @@ router.delete('/bank-account/:id', authMiddleware, async (req, res) => {
 router.get('/virtual-card', authMiddleware, async (req, res) => {
   try {
     const user = await User.findById(req.userId);
+
+    if (user.virtualCard?.id && flutterwaveService.isConfigured) {
+      const detailsResult = await flutterwaveService.getVirtualCardDetails(user.virtualCard.id);
+      if (detailsResult.success && detailsResult.card) {
+        user.virtualCard = {
+          ...user.virtualCard,
+          id: detailsResult.card.id || user.virtualCard.id,
+          cardNumber: detailsResult.card.card_number || user.virtualCard.cardNumber,
+          expiryMonth: detailsResult.card.expiration?.substring(0, 2) || user.virtualCard.expiryMonth,
+          expiryYear: detailsResult.card.expiration?.substring(2) || user.virtualCard.expiryYear,
+          cvv: detailsResult.card.cvv || user.virtualCard.cvv,
+          status: detailsResult.card.is_active === false ? 'frozen' : (detailsResult.card.status || user.virtualCard.status || 'active'),
+          balance: Number(detailsResult.card.amount || user.virtualCard.balance || 0)
+        };
+        await user.save();
+      }
+    }
+
     res.json({ virtualCard: user.virtualCard });
   } catch (error) {
     res.status(500).json({ message: 'Server error' });
@@ -247,19 +268,38 @@ router.post('/virtual-card', authMiddleware, async (req, res) => {
   try {
     const user = await User.findById(req.userId);
     const { color = 'purple' } = req.body;
-    if (user.virtualCard?.cardNumber) {
+    if (user.virtualCard?.id) {
       return res.status(400).json({ message: 'Virtual card already exists' });
     }
 
+    if (!flutterwaveService.isConfigured) {
+      return res.status(503).json({ message: 'Virtual card service is not configured' });
+    }
+
+    const cardResult = await flutterwaveService.createVirtualCard({
+      currency: 'USD',
+      amount: 0,
+      email: user.email,
+      firstName: user.firstName,
+      lastName: user.lastName,
+      phone: user.phone,
+      callbackUrl: process.env.APP_URL ? `${process.env.APP_URL}/webhooks/flutterwave` : undefined
+    });
+
+    if (!cardResult.success || !cardResult.card) {
+      return res.status(502).json({ message: cardResult.error || 'Unable to create virtual card' });
+    }
+
+    const expiration = String(cardResult.card.expiration || '');
     user.virtualCard = {
-      id: `CARD-${Date.now()}`,
+      id: cardResult.card.id,
       color,
-      cardNumber: `5399 ${Math.floor(1000 + Math.random() * 9000)} ${Math.floor(1000 + Math.random() * 9000)} ${Math.floor(1000 + Math.random() * 9000)}`,
-      expiryMonth: '12',
-      expiryYear: String(new Date().getFullYear() + 3),
-      cvv: String(Math.floor(100 + Math.random() * 900)),
-      status: 'active',
-      balance: 0
+      cardNumber: cardResult.card.card_number || null,
+      expiryMonth: expiration.substring(0, 2) || null,
+      expiryYear: expiration.substring(2) || null,
+      cvv: cardResult.card.cvv || null,
+      status: cardResult.card.status || 'active',
+      balance: Number(cardResult.card.amount || 0)
     };
     await user.save();
 
@@ -271,7 +311,7 @@ router.post('/virtual-card', authMiddleware, async (req, res) => {
 
 router.post('/virtual-card/fund', authMiddleware, async (req, res) => {
   try {
-    const { amount } = req.body;
+    const amount = Number(req.body.amount);
     const user = await User.findById(req.userId);
 
     if (!user.virtualCard?.cardNumber) {
@@ -283,29 +323,61 @@ router.post('/virtual-card/fund', authMiddleware, async (req, res) => {
     if (user.balances.NGN < amount) {
       return res.status(400).json({ message: 'Insufficient NGN balance' });
     }
+    if (!flutterwaveService.isConfigured) {
+      return res.status(503).json({ message: 'Virtual card service is not configured' });
+    }
 
-    user.balances.NGN -= amount;
-    user.virtualCard.balance += amount;
-    await user.save();
+    const providerResult = await flutterwaveService.fundVirtualCard(user.virtualCard.id, amount);
+    if (!providerResult.success) {
+      return res.status(502).json({ message: providerResult.error || 'Unable to fund virtual card' });
+    }
 
-    const transaction = new Transaction({
-      userId: user._id,
-      type: 'virtual_card',
-      amount,
-      currency: 'NGN',
-      description: 'Funded virtual card',
-      status: 'completed',
-      reference: `CARD-FUND-${Date.now()}`
+    const reference = `CARD-FUND-${Date.now()}`;
+    const { updatedUser } = await withTransaction(async (session) => {
+      const sessionUser = await User.findById(req.userId).session(session);
+      if (!sessionUser) {
+        throw new AppError('User not found', 404);
+      }
+      if (!sessionUser.virtualCard?.id) {
+        throw new AppError('Virtual card not found', 400);
+      }
+      if (Number(sessionUser.balances.NGN || 0) < amount) {
+        throw new AppError('Insufficient NGN balance', 400);
+      }
+
+      sessionUser.balances.NGN = Number((Number(sessionUser.balances.NGN || 0) - amount).toFixed(2));
+      sessionUser.virtualCard.balance = Number((Number(sessionUser.virtualCard.balance || 0) + amount).toFixed(2));
+
+      const transaction = new Transaction({
+        userId: sessionUser._id,
+        type: 'virtual_card',
+        amount,
+        currency: 'NGN',
+        description: 'Funded virtual card',
+        status: 'completed',
+        reference,
+        metadata: {
+          cardId: sessionUser.virtualCard.id,
+          provider: 'flutterwave',
+          providerResponse: providerResult.data || null
+        }
+      });
+
+      await Promise.all([
+        sessionUser.save({ session }),
+        transaction.save({ session })
+      ]);
+
+      return { updatedUser: sessionUser };
     });
-    await transaction.save();
 
     res.json({
       message: 'Virtual card funded',
-      virtualCard: user.virtualCard,
-      balances: user.balances
+      virtualCard: updatedUser.virtualCard,
+      balances: updatedUser.balances
     });
   } catch (error) {
-    res.status(500).json({ message: 'Server error' });
+    res.status(error.statusCode || 500).json({ message: error.message || 'Server error' });
   }
 });
 
@@ -316,8 +388,11 @@ router.post('/virtual-card/freeze', authMiddleware, async (req, res) => {
       return res.status(400).json({ message: 'Virtual card not found' });
     }
 
-    user.virtualCard.status =
-      user.virtualCard.status === 'frozen' ? 'active' : 'frozen';
+    if (user.virtualCard.status === 'cancelled' || user.virtualCard.status === 'blocked') {
+      return res.status(400).json({ message: `Virtual card cannot be toggled from ${user.virtualCard.status} state` });
+    }
+
+    user.virtualCard.status = user.virtualCard.status === 'frozen' ? 'active' : 'frozen';
     await user.save();
 
     res.json({

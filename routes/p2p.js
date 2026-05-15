@@ -12,12 +12,14 @@ const { getPlatformSettings } = require('../utils/admin');
 const {
   normalizeAsset,
   ensureSupportedAsset,
+  ensureSupportedPaymentMethod,
   lockFunds,
   unlockFunds,
   releaseLockedFunds,
   buildParticipant,
   getDefaultBankAccount,
-  isP2PAdmin
+  isP2PAdmin,
+  getAvailableBalance
 } = require('../utils/p2p');
 const { requireVerifiedKycForTransactions } = require('../middleware/kyc');
 const { AppError, handleError, asyncHandler } = require('../utils/errorHandler');
@@ -25,7 +27,17 @@ const { withTransaction } = require('../utils/database');
 const { createNotification } = require('../services/notifications');
 const Logger = require('../utils/logger');
 
-const toOfferPayload = (offer, viewerId = null) => ({
+const P2P_RELEASE_WINDOW_MINUTES = Number(process.env.P2P_RELEASE_WINDOW_MINUTES || 10);
+const P2P_KYC_NGN_LIMITS = {
+  0: 50000,
+  1: 500000,
+  2: Number.MAX_SAFE_INTEGER,
+  3: Number.MAX_SAFE_INTEGER
+};
+
+const toOfferPayload = (offer, viewerId = null) => {
+  const isMine = viewerId ? String(offer.creatorId?._id || offer.creatorId) === String(viewerId) : false;
+  return {
   id: offer._id,
   creatorId: offer.creatorId?._id || offer.creatorId,
   creator: offer.creatorId
@@ -44,13 +56,26 @@ const toOfferPayload = (offer, viewerId = null) => ({
   maxOrderAmount: offer.maxOrderAmount,
   paymentWindowMinutes: offer.paymentWindowMinutes,
   paymentMethod: offer.paymentMethod,
-  paymentDetails: offer.paymentDetails,
+  paymentMethods: offer.paymentMethods || [offer.paymentMethod || 'bank_transfer'],
+  paymentDetails: isMine ? offer.paymentDetails : null,
+  region: offer.region || 'NG',
+  merchantOnly: Boolean(offer.merchantOnly),
+  merchant: offer.creatorId
+    ? {
+        isMerchant: Boolean(offer.creatorId.p2pProfile?.isMerchant),
+        completionRate: Number(offer.creatorId.p2pProfile?.completionRate || 0),
+        totalTrades: Number(offer.creatorId.p2pProfile?.totalTrades || 0),
+        completedTrades: Number(offer.creatorId.p2pProfile?.completedTrades || 0),
+        totalVolumeNgn: Number(offer.creatorId.p2pProfile?.totalVolumeNgn || 0)
+      }
+    : null,
   terms: offer.terms,
   status: offer.status,
-  isMine: viewerId ? String(offer.creatorId?._id || offer.creatorId) === String(viewerId) : false,
+  isMine,
   createdAt: offer.createdAt,
   updatedAt: offer.updatedAt
-});
+  };
+};
 
 const toOrderPayload = (order, viewerId = null, dispute = null) => {
   const me = viewerId ? String(viewerId) : null;
@@ -63,24 +88,35 @@ const toOrderPayload = (order, viewerId = null, dispute = null) => {
     price: order.price,
     cryptoAmount: order.cryptoAmount,
     fiatAmount: order.fiatAmount,
+    total: order.fiatAmount,
     buyer: order.buyer,
     seller: order.seller,
+    escrow: {
+      sellerUserId: order.escrowUserId,
+      lockedAt: order.escrowLockedAt,
+      status: ['completed', 'cancelled', 'expired'].includes(order.status) ? 'released_or_unlocked' : 'locked'
+    },
     status: order.status,
     paymentMethod: order.paymentMethod,
+    paymentMethods: order.paymentMethods || [order.paymentMethod || 'bank_transfer'],
     paymentSnapshot: order.paymentSnapshot,
     paymentProofNote: order.paymentProofNote,
     paymentProofUrl: order.paymentProofUrl,
     paymentMarkedAt: order.paymentMarkedAt,
+    paymentConfirmedAt: order.paymentConfirmedAt,
+    paymentDeadlineAt: order.paymentDeadlineAt,
+    releaseDeadlineAt: order.releaseDeadlineAt,
     releaseNote: order.releaseNote,
     releasedAt: order.releasedAt,
     expiresAt: order.expiresAt,
-  createdAt: order.createdAt,
-  updatedAt: order.updatedAt,
-  cryptoFeeAmount: order.cryptoFeeAmount || 0,
-  cryptoReleaseAmount: order.cryptoReleaseAmount || order.cryptoAmount,
-  fiatFeeAmount: order.fiatFeeAmount || 0,
-  isBuyer: me === String(order.buyer?.userId || ''),
-  isSeller: me === String(order.seller?.userId || ''),
+    createdAt: order.createdAt,
+    updatedAt: order.updatedAt,
+    cryptoFeeAmount: order.cryptoFeeAmount || 0,
+    cryptoReleaseAmount: order.cryptoReleaseAmount || order.cryptoAmount,
+    fiatFeeAmount: order.fiatFeeAmount || 0,
+    chat: order.messages || [],
+    isBuyer: me === String(order.buyer?.userId || ''),
+    isSeller: me === String(order.seller?.userId || ''),
     dispute: dispute
       ? {
           id: dispute._id,
@@ -96,6 +132,98 @@ const toOrderPayload = (order, viewerId = null, dispute = null) => {
   };
 };
 
+function getTierLimitNgn(user) {
+  const level = Number(user?.kycLevel || 0);
+  return P2P_KYC_NGN_LIMITS[level] || P2P_KYC_NGN_LIMITS[0];
+}
+
+function updateP2PProfileStats(user, updates = {}) {
+  if (!user.p2pProfile) {
+    user.p2pProfile = {};
+  }
+
+  const current = user.p2pProfile;
+  current.totalTrades = Number(current.totalTrades || 0) + Number(updates.totalTrades || 0);
+  current.completedTrades = Number(current.completedTrades || 0) + Number(updates.completedTrades || 0);
+  current.cancelledTrades = Number(current.cancelledTrades || 0) + Number(updates.cancelledTrades || 0);
+  current.disputedTrades = Number(current.disputedTrades || 0) + Number(updates.disputedTrades || 0);
+  current.totalVolumeNgn = Number(current.totalVolumeNgn || 0) + Number(updates.totalVolumeNgn || 0);
+
+  if (updates.averageReleaseMinutes !== undefined && updates.averageReleaseMinutes !== null) {
+    const previousCompleted = Math.max(0, Number(current.completedTrades || 0) - Number(updates.completedTrades || 0));
+    const previousAverage = Number(current.averageReleaseMinutes || 0);
+    const previousWeighted = previousCompleted * previousAverage;
+    const nextCompleted = Number(current.completedTrades || 0);
+    current.averageReleaseMinutes = nextCompleted > 0
+      ? Number(((previousWeighted + Number(updates.averageReleaseMinutes)) / nextCompleted).toFixed(2))
+      : 0;
+  }
+
+  current.completionRate = Number(current.totalTrades || 0) > 0
+    ? Number(((Number(current.completedTrades || 0) / Number(current.totalTrades || 0)) * 100).toFixed(2))
+    : 0;
+  current.lastTradeAt = new Date();
+}
+
+function appendOrderMessage(order, senderUserId, senderLabel, message) {
+  if (!message) {
+    return;
+  }
+
+  order.messages.push({
+    senderUserId,
+    senderLabel,
+    message
+  });
+}
+
+async function expireOrderAndUnlockEscrow(order, session = null) {
+  if (!order || !['awaiting_payment', 'awaiting_release'].includes(order.status)) {
+    return order;
+  }
+
+  const now = new Date();
+  const deadline =
+    order.status === 'awaiting_payment'
+      ? order.paymentDeadlineAt || order.expiresAt
+      : order.releaseDeadlineAt || order.expiresAt;
+
+  if (!deadline || now <= new Date(deadline)) {
+    return order;
+  }
+
+  const previousStatus = order.status;
+  const [offer, seller] = await Promise.all([
+    P2POffer.findById(order.offerId).session(session),
+    User.findById(order.seller.userId).session(session)
+  ]);
+
+  unlockFunds(seller, order.asset, order.cryptoAmount);
+  order.status = 'expired';
+  order.cancelReason = previousStatus === 'awaiting_payment'
+    ? 'Buyer did not complete payment within the trade window'
+    : 'Seller did not release escrow within the release window';
+  appendOrderMessage(order, order.seller.userId, 'System', order.cancelReason);
+  order.updatedAt = now;
+
+  if (offer && offer.status !== 'cancelled') {
+    offer.availableAmount = Number(offer.availableAmount || 0) + Number(order.cryptoAmount || 0);
+    if (offer.status === 'completed') {
+      offer.status = 'open';
+    }
+    offer.updatedAt = now;
+    await offer.save({ session });
+  }
+
+  updateP2PProfileStats(seller, { totalTrades: 1, cancelledTrades: 1 });
+  await Promise.all([
+    seller.save({ session }),
+    order.save({ session })
+  ]);
+
+  return order;
+}
+
 function hasValidRequest(req, res) {
   const errors = validationResult(req);
   if (!errors.isEmpty()) {
@@ -110,10 +238,22 @@ async function getViewer(req) {
 }
 
 async function getOrderForUser(orderId, userId) {
-  return P2POrder.findOne({
+  const order = await P2POrder.findOne({
     _id: orderId,
     $or: [{ 'buyer.userId': userId }, { 'seller.userId': userId }]
   });
+  if (!order) {
+    return null;
+  }
+
+  await withTransaction(async (session) => {
+    const sessionOrder = await P2POrder.findById(order._id).session(session);
+    if (sessionOrder) {
+      await expireOrderAndUnlockEscrow(sessionOrder, session);
+    }
+  });
+
+  return P2POrder.findById(order._id);
 }
 
 async function applyP2PFeesAndRelease({ order, seller, buyer, adminUserId = null }) {
@@ -185,7 +325,11 @@ router.get(
   [
     query('side').optional().isIn(['buy', 'sell']),
     query('asset').optional().isString(),
-    query('status').optional().isIn(['open', 'paused', 'completed', 'cancelled'])
+    query('status').optional().isIn(['open', 'paused', 'completed', 'cancelled']),
+    query('paymentMethod').optional().isString(),
+    query('region').optional().isString(),
+    query('minFiatAmount').optional().isFloat({ min: 0 }),
+    query('maxFiatAmount').optional().isFloat({ min: 0 })
   ],
   async (req, res) => {
     try {
@@ -194,9 +338,28 @@ router.get(
       const filters = { status: req.query.status || 'open' };
       if (req.query.side) filters.side = req.query.side;
       if (req.query.asset) filters.asset = normalizeAsset(req.query.asset);
+      if (req.query.region) filters.region = String(req.query.region).trim().toUpperCase();
+      if (req.query.paymentMethod) filters.paymentMethods = String(req.query.paymentMethod).trim();
+
+      if (req.query.minFiatAmount || req.query.maxFiatAmount) {
+        filters.$expr = { $and: [] };
+        if (req.query.minFiatAmount) {
+          filters.$expr.$and.push({
+            $gte: [{ $multiply: ['$maxOrderAmount', '$price'] }, Number(req.query.minFiatAmount)]
+          });
+        }
+        if (req.query.maxFiatAmount) {
+          filters.$expr.$and.push({
+            $lte: [{ $multiply: ['$minOrderAmount', '$price'] }, Number(req.query.maxFiatAmount)]
+          });
+        }
+        if (!filters.$expr.$and.length) {
+          delete filters.$expr;
+        }
+      }
 
       const offers = await P2POffer.find(filters)
-        .populate('creatorId', 'username firstName lastName')
+        .populate('creatorId', 'username firstName lastName p2pProfile')
         .sort({ createdAt: -1 })
         .limit(100);
 
@@ -209,7 +372,9 @@ router.get(
 
 router.get('/offers/mine', authMiddleware, async (req, res) => {
   try {
-    const offers = await P2POffer.find({ creatorId: req.userId }).sort({ createdAt: -1 });
+    const offers = await P2POffer.find({ creatorId: req.userId })
+      .populate('creatorId', 'username firstName lastName p2pProfile')
+      .sort({ createdAt: -1 });
     res.json({ offers: offers.map((offer) => toOfferPayload(offer, req.userId)) });
   } catch (error) {
     res.status(500).json({ message: 'Server error' });
@@ -228,6 +393,10 @@ router.post(
     body('maxOrderAmount').isFloat({ min: 0.000001 }),
     body('paymentWindowMinutes').optional().isInt({ min: 5, max: 180 }),
     body('paymentMethod').optional().isString(),
+    body('paymentMethods').optional().isArray({ min: 1 }),
+    body('paymentDetails').optional().isObject(),
+    body('merchantOnly').optional().isBoolean(),
+    body('region').optional().isString(),
     body('terms').optional().isString()
   ],
   async (req, res) => {
@@ -239,6 +408,15 @@ router.post(
       const availableAmount = Number(req.body.availableAmount);
       const minOrderAmount = Number(req.body.minOrderAmount);
       const maxOrderAmount = Number(req.body.maxOrderAmount);
+      const fiatValueAtMax = Number((maxOrderAmount * Number(req.body.price)).toFixed(2));
+      const kycLimitNgn = getTierLimitNgn(creator);
+      const paymentMethods = Array.isArray(req.body.paymentMethods) && req.body.paymentMethods.length
+        ? req.body.paymentMethods.map((method) => String(method).trim().toLowerCase())
+        : [String(req.body.paymentMethod || 'bank_transfer').trim().toLowerCase()];
+
+      if (paymentMethods.some((method) => !ensureSupportedPaymentMethod(method))) {
+        return res.status(400).json({ message: 'Unsupported payment method' });
+      }
 
       if (minOrderAmount > maxOrderAmount) {
         return res.status(400).json({ message: 'Minimum order amount cannot exceed maximum order amount' });
@@ -248,8 +426,20 @@ router.post(
         return res.status(400).json({ message: 'Available amount must cover the minimum order amount' });
       }
 
-      if (req.body.side === 'sell' && Number(creator.balances[asset] || 0) < availableAmount) {
+      if (fiatValueAtMax > kycLimitNgn) {
+        return res.status(400).json({ message: `Your KYC tier allows a maximum P2P order value of NGN ${kycLimitNgn.toLocaleString()}` });
+      }
+
+      if (req.body.merchantOnly && creator?.p2pProfile?.merchantStatus !== 'approved') {
+        return res.status(400).json({ message: 'Only approved merchants can create merchant-only offers' });
+      }
+
+      if (req.body.side === 'sell' && getAvailableBalance(creator, asset) < availableAmount) {
         return res.status(400).json({ message: `Insufficient ${asset} balance to create this sell offer` });
+      }
+
+      if (req.body.side === 'sell' && !req.body.paymentDetails?.accountNumber && !getDefaultBankAccount(creator)) {
+        return res.status(400).json({ message: 'Add a bank account or provide payment details before creating a sell offer' });
       }
 
       const offer = new P2POffer({
@@ -257,13 +447,16 @@ router.post(
         side: req.body.side,
         asset,
         fiatCurrency: 'NGN',
+        region: String(req.body.region || creator?.p2pProfile?.region || 'NG').trim().toUpperCase(),
         price: Number(req.body.price),
         availableAmount,
         minOrderAmount,
         maxOrderAmount,
         paymentWindowMinutes: Number(req.body.paymentWindowMinutes || 30),
-        paymentMethod: req.body.paymentMethod || 'bank_transfer',
+        paymentMethod: paymentMethods[0],
+        paymentMethods,
         paymentDetails: req.body.paymentDetails || {},
+        merchantOnly: Boolean(req.body.merchantOnly),
         terms: req.body.terms || ''
       });
 
@@ -284,6 +477,10 @@ router.patch(
     body('price').optional().isFloat({ min: 0.0001 }),
     body('minOrderAmount').optional().isFloat({ min: 0.000001 }),
     body('maxOrderAmount').optional().isFloat({ min: 0.000001 }),
+    body('paymentMethods').optional().isArray({ min: 1 }),
+    body('paymentDetails').optional().isObject(),
+    body('merchantOnly').optional().isBoolean(),
+    body('region').optional().isString(),
     body('terms').optional().isString()
   ],
   async (req, res) => {
@@ -311,6 +508,29 @@ router.patch(
         offer.paymentDetails = req.body.paymentDetails;
       }
 
+      if (req.body.paymentMethods) {
+        const paymentMethods = req.body.paymentMethods.map((method) => String(method).trim().toLowerCase());
+        if (paymentMethods.some((method) => !ensureSupportedPaymentMethod(method))) {
+          return res.status(400).json({ message: 'Unsupported payment method' });
+        }
+        offer.paymentMethods = paymentMethods;
+        offer.paymentMethod = paymentMethods[0];
+      }
+
+      if (req.body.region !== undefined) {
+        offer.region = String(req.body.region || 'NG').trim().toUpperCase();
+      }
+
+      if (req.body.merchantOnly !== undefined) {
+        if (Boolean(req.body.merchantOnly) && req.body.merchantOnly !== offer.merchantOnly) {
+          const owner = await getViewer(req);
+          if (owner?.p2pProfile?.merchantStatus !== 'approved') {
+            return res.status(400).json({ message: 'Only approved merchants can mark an offer as merchant-only' });
+          }
+        }
+        offer.merchantOnly = Boolean(req.body.merchantOnly);
+      }
+
       offer.updatedAt = new Date();
       await offer.save();
       res.json({ message: 'Offer updated', offer: toOfferPayload(offer, req.userId) });
@@ -324,7 +544,11 @@ router.post(
   '/offers/:offerId/order',
   authMiddleware,
   requireVerifiedKycForTransactions,
-  [param('offerId').isMongoId(), body('cryptoAmount').isFloat({ min: 0.000001 })],
+  [
+    param('offerId').isMongoId(),
+    body('cryptoAmount').isFloat({ min: 0.000001 }),
+    body('paymentMethod').optional().isString()
+  ],
   asyncHandler(async (req, res) => {
     const logger = new Logger('p2p/take-offer');
     
@@ -351,99 +575,150 @@ router.post(
     const [maker, taker] = await Promise.all([User.findById(offer.creatorId), User.findById(req.userId)]);
     const seller = offer.side === 'sell' ? maker : taker;
     const buyer = offer.side === 'sell' ? taker : maker;
+    const fiatAmount = Number((cryptoAmount * offer.price).toFixed(2));
+    const buyerLimitNgn = getTierLimitNgn(buyer);
+    const sellerLimitNgn = getTierLimitNgn(seller);
 
-    if (offer.side === 'buy' && !getDefaultBankAccount(seller)) {
-      throw new AppError('Add a bank account before selling into a buy offer', 400);
-    }
-
-    // FIX: Check available balance AFTER locked balances (not just total balance)
-    const sellerBalance = seller.balances[offer.asset] || 0;
-    const sellerLockedBalance = seller.lockedBalances?.[offer.asset] || 0;
-    const sellerAvailableBalance = sellerBalance - sellerLockedBalance;
-
-    if (sellerAvailableBalance < cryptoAmount) {
-      throw new AppError(
-        `Insufficient available ${offer.asset} balance. Available: ${sellerAvailableBalance}, Required: ${cryptoAmount}`,
-        400
-      );
-    }
-
-    // Use transaction to ensure atomicity
-    return withTransaction(async (session) => {
-      // Lock the funds within the transaction
-      lockFunds(seller, offer.asset, cryptoAmount);
-
-      // Update offer
-      offer.availableAmount = Math.max(0, Number(offer.availableAmount) - cryptoAmount);
-      if (offer.availableAmount === 0) {
-        offer.status = 'completed';
+      if (fiatAmount > buyerLimitNgn || fiatAmount > sellerLimitNgn) {
+        throw new AppError('This trade exceeds the P2P limit for one of the participants', 400);
       }
-      offer.updatedAt = new Date();
 
-      // Create order
-      const order = new P2POrder({
-        offerId: offer._id,
-        offerOwnerId: maker._id,
-        takerId: taker._id,
-        asset: offer.asset,
-        fiatCurrency: offer.fiatCurrency,
-        price: offer.price,
-        cryptoAmount,
-        fiatAmount: Number((cryptoAmount * offer.price).toFixed(2)),
-        buyer: buildParticipant(buyer),
-        seller: buildParticipant(seller),
-        escrowUserId: seller._id,
-        paymentMethod: offer.paymentMethod,
-        paymentSnapshot:
-          offer.side === 'sell'
+      if (offer.side === 'buy' && !getDefaultBankAccount(seller)) {
+        throw new AppError('Add a bank account before selling into a buy offer', 400);
+      }
+
+      const selectedPaymentMethod = String(
+        req.body.paymentMethod || offer.paymentMethod || (offer.paymentMethods || [])[0] || 'bank_transfer'
+      )
+        .trim()
+        .toLowerCase();
+      const supportedMethods = (offer.paymentMethods || [offer.paymentMethod || 'bank_transfer']).map((method) =>
+        String(method).trim().toLowerCase()
+      );
+      if (!supportedMethods.includes(selectedPaymentMethod)) {
+        throw new AppError('Selected payment method is not supported by this offer', 400);
+      }
+
+      const sellerAvailableBalance = getAvailableBalance(seller, offer.asset);
+
+      if (sellerAvailableBalance < cryptoAmount) {
+        throw new AppError(
+          `Insufficient available ${offer.asset} balance. Available: ${sellerAvailableBalance}, Required: ${cryptoAmount}`,
+          400
+        );
+      }
+
+      return withTransaction(async (session) => {
+        const [sessionOffer, sessionSeller] = await Promise.all([
+          P2POffer.findById(offer._id).session(session),
+          User.findById(seller._id).session(session)
+        ]);
+
+        if (!sessionOffer || sessionOffer.status !== 'open') {
+          throw new AppError('Offer not available', 404);
+        }
+
+        if (Number(sessionOffer.availableAmount || 0) < cryptoAmount) {
+          throw new AppError('Offer does not have enough available liquidity', 400);
+        }
+
+        if (getAvailableBalance(sessionSeller, sessionOffer.asset) < cryptoAmount) {
+          throw new AppError(`Insufficient available ${sessionOffer.asset} balance for escrow`, 400);
+        }
+
+        lockFunds(sessionSeller, sessionOffer.asset, cryptoAmount);
+
+        sessionOffer.availableAmount = Math.max(0, Number(sessionOffer.availableAmount) - cryptoAmount);
+        if (sessionOffer.availableAmount === 0) {
+          sessionOffer.status = 'completed';
+        }
+        sessionOffer.updatedAt = new Date();
+
+        const order = new P2POrder({
+          offerId: sessionOffer._id,
+          offerOwnerId: maker._id,
+          takerId: taker._id,
+          asset: sessionOffer.asset,
+          fiatCurrency: sessionOffer.fiatCurrency,
+          price: sessionOffer.price,
+          cryptoAmount,
+          fiatAmount,
+          buyer: buildParticipant(buyer),
+          seller: buildParticipant(seller),
+          escrowUserId: seller._id,
+          paymentMethod: selectedPaymentMethod,
+          paymentMethods: sessionOffer.paymentMethods || [sessionOffer.paymentMethod || 'bank_transfer'],
+          paymentSnapshot:
+            sessionOffer.side === 'sell'
             ? {
-                bankName: offer.paymentDetails?.bankName || null,
-                bankCode: offer.paymentDetails?.bankCode || null,
-                accountNumber: offer.paymentDetails?.accountNumber || null,
-                accountName: offer.paymentDetails?.accountName || null,
-                instructions: offer.paymentDetails?.instructions || offer.terms || null
+                bankName: sessionOffer.paymentDetails?.bankName || null,
+                bankCode: sessionOffer.paymentDetails?.bankCode || null,
+                accountNumber: sessionOffer.paymentDetails?.accountNumber || null,
+                accountName: sessionOffer.paymentDetails?.accountName || null,
+                instructions: sessionOffer.paymentDetails?.instructions || sessionOffer.terms || null
               }
             : getDefaultBankAccount(seller),
-        // FIX: Set proper expiration time
-        expiresAt: new Date(Date.now() + offer.paymentWindowMinutes * 60 * 1000),
-        reference: `P2P-${Date.now()}-${Math.random().toString(36).slice(2, 8).toUpperCase()}`
+          escrowLockedAt: new Date(),
+          paymentDeadlineAt: new Date(Date.now() + sessionOffer.paymentWindowMinutes * 60 * 1000),
+          expiresAt: new Date(Date.now() + sessionOffer.paymentWindowMinutes * 60 * 1000),
+          reference: `P2P-${Date.now()}-${Math.random().toString(36).slice(2, 8).toUpperCase()}`,
+          messages: []
+        });
+
+        appendOrderMessage(
+          order,
+          req.userId,
+          'System',
+          `Trade opened for ${cryptoAmount} ${sessionOffer.asset} at ${sessionOffer.price} ${sessionOffer.fiatCurrency}/${sessionOffer.asset}. Seller funds are now locked in escrow.`
+        );
+
+        await Promise.all([
+          sessionSeller.save({ session }),
+          sessionOffer.save({ session }),
+          order.save({ session })
+        ]);
+
+        logger.info(`P2P order created: ${order.reference}, seller: ${seller._id}, buyer: ${buyer._id}, amount: ${cryptoAmount} ${offer.asset}`);
+
+        const buyerMessage = offer.side === 'sell' ? 'buy' : 'sell';
+        await createNotification({
+          user: buyer,
+          type: 'receive',
+          title: 'P2P order created',
+          body: `You have a pending P2P order to ${buyerMessage} ${cryptoAmount} ${offer.asset}. Complete payment within ${offer.paymentWindowMinutes} minutes.`,
+          data: {
+            orderId: order._id,
+            reference: order.reference,
+            amount: cryptoAmount,
+            currency: offer.asset
+          },
+          sendEmail: true
+        });
+
+        res.status(201).json({
+          success: true,
+          message: 'P2P order created and crypto locked in escrow',
+          order: toOrderPayload(order, req.userId)
+        });
       });
-
-      await Promise.all([
-        seller.save({ session }),
-        offer.save({ session }),
-        order.save({ session })
-      ]);
-
-      logger.info(`P2P order created: ${order.reference}, seller: ${seller._id}, buyer: ${buyer._id}, amount: ${cryptoAmount} ${offer.asset}`);
-
-      // Send notifications
-      const buyerMessage = offer.side === 'sell' ? 'buy' : 'sell';
-      await createNotification({
-        user: buyer,
-        type: 'receive',
-        title: 'P2P order created',
-        body: `You have a pending P2P order to ${buyerMessage} ${cryptoAmount} ${offer.asset}. Complete payment within ${offer.paymentWindowMinutes} minutes.`,
-        data: {
-          orderId: order._id,
-          reference: order.reference,
-          amount: cryptoAmount,
-          currency: offer.asset
-        },
-        sendEmail: true
-      });
-
-      res.status(201).json({
-        success: true,
-        message: 'P2P order created and crypto locked in escrow',
-        order: toOrderPayload(order, req.userId)
-      });
-    });
   })
 );
 
 router.get('/orders', authMiddleware, async (req, res) => {
   try {
+    const rawOrders = await P2POrder.find({
+      $or: [{ 'buyer.userId': req.userId }, { 'seller.userId': req.userId }]
+    }).sort({ createdAt: -1 });
+
+    for (const order of rawOrders) {
+      await withTransaction(async (session) => {
+        const sessionOrder = await P2POrder.findById(order._id).session(session);
+        if (sessionOrder) {
+          await expireOrderAndUnlockEscrow(sessionOrder, session);
+        }
+      });
+    }
+
     const orders = await P2POrder.find({
       $or: [{ 'buyer.userId': req.userId }, { 'seller.userId': req.userId }]
     }).sort({ createdAt: -1 });
@@ -496,11 +771,16 @@ router.post(
       if (order.status !== 'awaiting_payment') {
         return res.status(400).json({ message: 'This order is not awaiting payment' });
       }
+      if (order.paymentDeadlineAt && new Date() > new Date(order.paymentDeadlineAt)) {
+        return res.status(400).json({ message: 'The payment window has expired for this trade' });
+      }
 
-      order.status = 'payment_sent';
+      order.status = 'awaiting_release';
       order.paymentProofNote = req.body.proofNote || null;
       order.paymentProofUrl = req.body.proofUrl || null;
       order.paymentMarkedAt = new Date();
+      order.releaseDeadlineAt = new Date(Date.now() + P2P_RELEASE_WINDOW_MINUTES * 60 * 1000);
+      appendOrderMessage(order, req.userId, 'Buyer', req.body.proofNote || 'Buyer marked this order as paid.');
       order.updatedAt = new Date();
       await order.save();
 
@@ -529,71 +809,87 @@ router.post(
       throw new AppError('Only the seller can release escrow', 403);
     }
 
-    // FIX: Check if order has expired
-    if (order.expiresAt && new Date() > order.expiresAt) {
-      throw new AppError('This order has expired. Please cancel and create a new one.', 400);
+    if (order.releaseDeadlineAt && new Date() > new Date(order.releaseDeadlineAt)) {
+      throw new AppError('This order has passed the seller release window', 400);
     }
 
-    if (!['payment_sent', 'awaiting_payment'].includes(order.status)) {
+    if (order.status !== 'awaiting_release') {
       throw new AppError('This order cannot be released', 400);
     }
 
-    // FIX: Require payment confirmation from buyer first if still awaiting payment
-    if (order.status === 'awaiting_payment') {
-      throw new AppError('Buyer has not marked payment as sent yet', 400);
-    }
-
     return withTransaction(async (session) => {
-      const [seller, buyer] = await Promise.all([
-        User.findById(order.seller.userId),
-        User.findById(order.buyer.userId)
+      const [sessionOrder, seller, buyer] = await Promise.all([
+        P2POrder.findById(order._id).session(session),
+        User.findById(order.seller.userId).session(session),
+        User.findById(order.buyer.userId).session(session)
       ]);
 
-      // Apply fees and release crypto
-      await applyP2PFeesAndRelease({ order, seller, buyer });
+      if (!sessionOrder) {
+        throw new AppError('Order not found', 404);
+      }
+      if (sessionOrder.status !== 'awaiting_release') {
+        throw new AppError('This order cannot be released', 400);
+      }
 
-      // Update order status within transaction
-      order.status = 'completed';
-      order.releaseNote = req.body.releaseNote || null;
-      order.releasedAt = new Date();
-      order.updatedAt = new Date();
+      await applyP2PFeesAndRelease({ order: sessionOrder, seller, buyer });
 
-      // Create transactions for record keeping
+      sessionOrder.status = 'completed';
+      sessionOrder.releaseNote = req.body.releaseNote || null;
+      sessionOrder.releasedAt = new Date();
+      sessionOrder.paymentConfirmedAt = sessionOrder.releasedAt;
+      appendOrderMessage(sessionOrder, req.userId, 'Seller', req.body.releaseNote || 'Seller confirmed payment and released escrow.');
+      sessionOrder.updatedAt = new Date();
+
+      const releaseMinutes = sessionOrder.paymentMarkedAt
+        ? Number(((new Date(sessionOrder.releasedAt) - new Date(sessionOrder.paymentMarkedAt)) / 60000).toFixed(2))
+        : null;
+      updateP2PProfileStats(seller, {
+        totalTrades: 1,
+        completedTrades: 1,
+        totalVolumeNgn: sessionOrder.fiatAmount,
+        averageReleaseMinutes: releaseMinutes
+      });
+      updateP2PProfileStats(buyer, {
+        totalTrades: 1,
+        completedTrades: 1,
+        totalVolumeNgn: sessionOrder.fiatAmount
+      });
+
       const sellerTx = new Transaction({
         userId: seller._id,
         type: 'p2p_sell',
-        amount: order.cryptoAmount,
-        currency: order.asset,
-        description: `P2P sale to ${order.buyer.fullName || order.buyer.username || 'buyer'}`,
+        amount: sessionOrder.cryptoAmount,
+        currency: sessionOrder.asset,
+        description: `P2P sale to ${sessionOrder.buyer.fullName || sessionOrder.buyer.username || 'buyer'}`,
         status: 'completed',
         toUserId: buyer._id,
-        toUsername: order.buyer.username,
-        reference: `${order.reference}-SELL`,
-        metadata: { p2pOrderId: order._id, fiatAmount: order.fiatAmount, price: order.price }
+        toUsername: sessionOrder.buyer.username,
+        reference: `${sessionOrder.reference}-SELL`,
+        metadata: { p2pOrderId: sessionOrder._id, fiatAmount: sessionOrder.fiatAmount, price: sessionOrder.price }
       });
 
       const buyerTx = new Transaction({
         userId: buyer._id,
         type: 'p2p_buy',
-        amount: order.cryptoAmount,
-        currency: order.asset,
-        description: `P2P purchase from ${order.seller.fullName || order.seller.username || 'seller'}`,
+        amount: sessionOrder.cryptoAmount,
+        currency: sessionOrder.asset,
+        description: `P2P purchase from ${sessionOrder.seller.fullName || sessionOrder.seller.username || 'seller'}`,
         status: 'completed',
         fromUserId: seller._id,
-        fromUsername: order.seller.username,
-        reference: `${order.reference}-BUY`,
-        metadata: { p2pOrderId: order._id, fiatAmount: order.fiatAmount, price: order.price }
+        fromUsername: sessionOrder.seller.username,
+        reference: `${sessionOrder.reference}-BUY`,
+        metadata: { p2pOrderId: sessionOrder._id, fiatAmount: sessionOrder.fiatAmount, price: sessionOrder.price }
       });
 
       await Promise.all([
         seller.save({ session }),
         buyer.save({ session }),
-        order.save({ session }),
+        sessionOrder.save({ session }),
         sellerTx.save({ session }),
         buyerTx.save({ session })
       ]);
 
-      logger.info(`P2P order completed: ${order.reference}, seller: ${seller._id}, buyer: ${buyer._id}`);
+      logger.info(`P2P order completed: ${sessionOrder.reference}, seller: ${seller._id}, buyer: ${buyer._id}`);
 
       // Send notifications
       await Promise.all([
@@ -601,12 +897,12 @@ router.post(
           user: seller,
           type: 'send',
           title: 'P2P sale completed',
-          body: `You successfully sold ${order.cryptoAmount} ${order.asset} to ${order.buyer.username}`,
+          body: `You successfully sold ${sessionOrder.cryptoAmount} ${sessionOrder.asset} to ${sessionOrder.buyer.username}`,
           data: {
-            orderId: order._id,
-            reference: order.reference,
-            amount: order.cryptoAmount,
-            feeAmount: order.cryptoFeeAmount
+            orderId: sessionOrder._id,
+            reference: sessionOrder.reference,
+            amount: sessionOrder.cryptoAmount,
+            feeAmount: sessionOrder.cryptoFeeAmount
           },
           sendEmail: true
         }),
@@ -614,11 +910,11 @@ router.post(
           user: buyer,
           type: 'receive',
           title: 'P2P purchase completed',
-          body: `Your purchase of ${order.cryptoAmount} ${order.asset} has been completed. Crypto is now available in your wallet.`,
+          body: `Your purchase of ${sessionOrder.cryptoAmount} ${sessionOrder.asset} has been completed. Crypto is now available in your wallet.`,
           data: {
-            orderId: order._id,
-            reference: order.reference,
-            amount: order.cryptoAmount
+            orderId: sessionOrder._id,
+            reference: sessionOrder.reference,
+            amount: sessionOrder.cryptoAmount
           },
           sendEmail: true
         })
@@ -627,7 +923,7 @@ router.post(
       res.json({
         success: true,
         message: 'Escrow released successfully',
-        order: toOrderPayload(order, req.userId)
+        order: toOrderPayload(sessionOrder, req.userId)
       });
     });
   })
@@ -647,58 +943,75 @@ router.post(
       throw new AppError('Order not found', 404);
     }
 
-    if (!['awaiting_payment', 'payment_sent'].includes(order.status)) {
+    if (!['awaiting_payment', 'awaiting_release'].includes(order.status)) {
       throw new AppError('This order cannot be cancelled', 400);
     }
 
-    // FIX: Only seller can cancel if payment_sent (payment confirmation was made)
-    if (order.status === 'payment_sent' && String(order.seller.userId) !== String(req.userId)) {
+    if (order.status === 'awaiting_release' && String(order.seller.userId) !== String(req.userId)) {
       throw new AppError('Seller must review or dispute after payment is marked sent', 400);
     }
 
     return withTransaction(async (session) => {
-      const [offer, seller] = await Promise.all([
-        P2POffer.findById(order.offerId),
-        User.findById(order.seller.userId)
+      const [sessionOrder, offer, seller] = await Promise.all([
+        P2POrder.findById(order._id).session(session),
+        P2POffer.findById(order.offerId).session(session),
+        User.findById(order.seller.userId).session(session)
       ]);
 
+      if (!sessionOrder) {
+        throw new AppError('Order not found', 404);
+      }
+      if (!['awaiting_payment', 'awaiting_release'].includes(sessionOrder.status)) {
+        throw new AppError('This order cannot be cancelled', 400);
+      }
+
       // Unlock funds
-      unlockFunds(seller, order.asset, order.cryptoAmount);
+      unlockFunds(seller, sessionOrder.asset, sessionOrder.cryptoAmount);
 
       // Restore offer availability if not cancelled
       if (offer && offer.status !== 'cancelled') {
-        offer.availableAmount = Number(offer.availableAmount) + Number(order.cryptoAmount);
+        offer.availableAmount = Number(offer.availableAmount) + Number(sessionOrder.cryptoAmount);
         if (offer.status === 'completed') {
           offer.status = 'open';
         }
         offer.updatedAt = new Date();
       }
 
-      order.status = 'cancelled';
-      order.cancelledByUserId = req.userId;
-      order.cancelReason = req.body.reason || null;
-      order.updatedAt = new Date();
+      sessionOrder.status = 'cancelled';
+      sessionOrder.cancelledByUserId = req.userId;
+      sessionOrder.cancelReason = req.body.reason || null;
+      appendOrderMessage(
+        sessionOrder,
+        req.userId,
+        String(sessionOrder.seller.userId) === String(req.userId) ? 'Seller' : 'Buyer',
+        req.body.reason || 'Trade cancelled.'
+      );
+      sessionOrder.updatedAt = new Date();
+
+      updateP2PProfileStats(seller, { totalTrades: 1, cancelledTrades: 1 });
 
       await Promise.all([
         seller.save({ session }),
-        order.save({ session }),
+        sessionOrder.save({ session }),
         ...(offer ? [offer.save({ session })] : [])
       ]);
 
-      logger.info(`P2P order cancelled: ${order.reference}, reason: ${req.body.reason || 'unspecified'}`);
+      logger.info(`P2P order cancelled: ${sessionOrder.reference}, reason: ${req.body.reason || 'unspecified'}`);
 
       // Send notification to other party
-      const otherUserId = String(order.buyer.userId) === String(req.userId) ? order.seller.userId : order.buyer.userId;
+      const otherUserId = String(sessionOrder.buyer.userId) === String(req.userId)
+        ? sessionOrder.seller.userId
+        : sessionOrder.buyer.userId;
       const otherUser = await User.findById(otherUserId);
       if (otherUser) {
         await createNotification({
           user: otherUser,
           type: 'p2p',
           title: 'P2P order cancelled',
-          body: `The P2P order for ${order.cryptoAmount} ${order.asset} has been cancelled.`,
+          body: `The P2P order for ${sessionOrder.cryptoAmount} ${sessionOrder.asset} has been cancelled.`,
           data: {
-            orderId: order._id,
-            reference: order.reference
+            orderId: sessionOrder._id,
+            reference: sessionOrder.reference
           },
           sendEmail: true
         });
@@ -707,10 +1020,39 @@ router.post(
       res.json({
         success: true,
         message: 'Order cancelled and escrow returned',
-        order: toOrderPayload(order, req.userId)
+        order: toOrderPayload(sessionOrder, req.userId)
       });
     });
   })
+);
+
+router.post(
+  '/orders/:orderId/message',
+  authMiddleware,
+  [param('orderId').isMongoId(), body('message').isLength({ min: 2, max: 1000 })],
+  async (req, res) => {
+    try {
+      if (!hasValidRequest(req, res)) return;
+
+      const order = await getOrderForUser(req.params.orderId, req.userId);
+      if (!order) {
+        return res.status(404).json({ message: 'Order not found' });
+      }
+
+      if (!['awaiting_payment', 'awaiting_release', 'disputed'].includes(order.status)) {
+        return res.status(400).json({ message: 'This trade is not open for chat' });
+      }
+
+      const senderLabel = String(order.buyer.userId) === String(req.userId) ? 'Buyer' : 'Seller';
+      appendOrderMessage(order, req.userId, senderLabel, req.body.message.trim());
+      order.updatedAt = new Date();
+      await order.save();
+
+      res.json({ message: 'Trade message sent', order: toOrderPayload(order, req.userId) });
+    } catch (error) {
+      res.status(500).json({ message: 'Server error' });
+    }
+  }
 );
 
 router.post(
@@ -733,7 +1075,7 @@ router.post(
       if (order.disputeId) {
         return res.status(400).json({ message: 'This order already has a dispute' });
       }
-      if (!['awaiting_payment', 'payment_sent'].includes(order.status)) {
+      if (!['awaiting_payment', 'awaiting_release'].includes(order.status)) {
         return res.status(400).json({ message: 'Only active orders can be disputed' });
       }
 
@@ -763,7 +1105,17 @@ router.post(
       await dispute.save();
       order.status = 'disputed';
       order.disputeId = dispute._id;
+      appendOrderMessage(order, req.userId, 'System', 'Trade moved to dispute review.');
       order.updatedAt = new Date();
+
+      const [buyer, seller] = await Promise.all([
+        User.findById(order.buyer.userId),
+        User.findById(order.seller.userId)
+      ]);
+      updateP2PProfileStats(buyer, { disputedTrades: 1 });
+      updateP2PProfileStats(seller, { disputedTrades: 1 });
+
+      await Promise.all([buyer.save(), seller.save()]);
       await order.save();
 
       res.status(201).json({
@@ -842,7 +1194,7 @@ router.post(
     body('outcome').isIn(['release_to_buyer', 'refund_to_seller', 'dismissed']),
     body('note').optional().isString()
   ],
-  async (req, res) => {
+  asyncHandler(async (req, res) => {
     try {
       if (!hasValidRequest(req, res)) return;
 
@@ -861,47 +1213,80 @@ router.post(
         return res.status(404).json({ message: 'Order not found for dispute' });
       }
 
-      const [seller, buyer] = await Promise.all([User.findById(order.seller.userId), User.findById(order.buyer.userId)]);
+      await withTransaction(async (session) => {
+        const [sessionOrder, sessionDispute, seller, buyer] = await Promise.all([
+          P2POrder.findById(order._id).session(session),
+          P2PDispute.findById(dispute._id).session(session),
+          User.findById(order.seller.userId).session(session),
+          User.findById(order.buyer.userId).session(session)
+        ]);
 
-      if (req.body.outcome === 'release_to_buyer') {
-        await applyP2PFeesAndRelease({ order, seller, buyer, adminUserId: admin._id });
-        order.status = 'completed';
-        order.releasedAt = new Date();
-      } else {
-        unlockFunds(seller, order.asset, order.cryptoAmount);
-        const offer = await P2POffer.findById(order.offerId);
-        if (offer && offer.status !== 'cancelled') {
-          offer.availableAmount = Number(offer.availableAmount) + Number(order.cryptoAmount);
-          if (offer.status === 'completed') {
-            offer.status = 'open';
-          }
-          offer.updatedAt = new Date();
-          await offer.save();
+        if (!sessionOrder || !sessionDispute || sessionDispute.status !== 'open') {
+          throw new AppError('Open dispute not found', 404);
         }
-        order.status = 'cancelled';
-      }
 
-      order.updatedAt = new Date();
-      dispute.status = req.body.outcome === 'dismissed' ? 'dismissed' : 'resolved';
-      dispute.resolution = {
-        outcome: req.body.outcome,
-        note: req.body.note || null,
-        resolvedByUserId: admin._id,
-        resolvedAt: new Date()
-      };
-      dispute.updatedAt = new Date();
+        if (req.body.outcome === 'release_to_buyer') {
+          await applyP2PFeesAndRelease({ order: sessionOrder, seller, buyer, adminUserId: admin._id });
+          sessionOrder.status = 'completed';
+          sessionOrder.releasedAt = new Date();
+          appendOrderMessage(sessionOrder, admin._id, 'Admin', req.body.note || 'Admin released escrow to the buyer.');
+          updateP2PProfileStats(seller, {
+            totalTrades: 1,
+            completedTrades: 1,
+            totalVolumeNgn: sessionOrder.fiatAmount
+          });
+          updateP2PProfileStats(buyer, {
+            totalTrades: 1,
+            completedTrades: 1,
+            totalVolumeNgn: sessionOrder.fiatAmount
+          });
+        } else if (req.body.outcome === 'refund_to_seller') {
+          unlockFunds(seller, sessionOrder.asset, sessionOrder.cryptoAmount);
+          const offer = await P2POffer.findById(sessionOrder.offerId).session(session);
+          if (offer && offer.status !== 'cancelled') {
+            offer.availableAmount = Number(offer.availableAmount) + Number(sessionOrder.cryptoAmount);
+            if (offer.status === 'completed') {
+              offer.status = 'open';
+            }
+            offer.updatedAt = new Date();
+            await offer.save({ session });
+          }
+          sessionOrder.status = 'cancelled';
+          sessionOrder.cancelReason = req.body.note || 'Admin refunded escrow to the seller.';
+          appendOrderMessage(sessionOrder, admin._id, 'Admin', sessionOrder.cancelReason);
+          updateP2PProfileStats(seller, { totalTrades: 1, cancelledTrades: 1 });
+        } else {
+          sessionOrder.status = sessionOrder.paymentMarkedAt ? 'awaiting_release' : 'awaiting_payment';
+          appendOrderMessage(sessionOrder, admin._id, 'Admin', req.body.note || 'Dispute dismissed. Trade returned to participants.');
+        }
 
-      await Promise.all([seller.save(), buyer.save(), order.save(), dispute.save()]);
+        sessionOrder.updatedAt = new Date();
+        sessionDispute.status = req.body.outcome === 'dismissed' ? 'dismissed' : 'resolved';
+        sessionDispute.resolution = {
+          outcome: req.body.outcome,
+          note: req.body.note || null,
+          resolvedByUserId: admin._id,
+          resolvedAt: new Date()
+        };
+        sessionDispute.updatedAt = new Date();
 
-      res.json({
-        message: 'Dispute resolved',
-        order: toOrderPayload(order, req.userId, dispute),
-        dispute
+        await Promise.all([
+          seller.save({ session }),
+          buyer.save({ session }),
+          sessionOrder.save({ session }),
+          sessionDispute.save({ session })
+        ]);
+
+        res.json({
+          message: 'Dispute resolved',
+          order: toOrderPayload(sessionOrder, req.userId, sessionDispute),
+          dispute: sessionDispute
+        });
       });
     } catch (error) {
       res.status(500).json({ message: error.message || 'Server error' });
     }
-  }
+  })
 );
 
 // Global error handler for P2P routes

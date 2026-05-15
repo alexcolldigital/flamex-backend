@@ -9,6 +9,21 @@ const vtpassService = require('../services/vtpass');
 const { createNotification } = require('../services/notifications');
 const { requireVerifiedKycForTransactions } = require('../middleware/kyc');
 const { getGiftCardConfig, findSupportedCard } = require('../utils/giftcards');
+const { withTransaction } = require('../utils/database');
+const { AppError } = require('../utils/errorHandler');
+
+const ELECTRICITY_SERVICE_IDS = {
+  ikedc: 'ikeja-electric',
+  ekedc: 'eko-electric',
+  aedc: 'abuja-electric',
+  ibedc: 'ibadan-electric',
+  kedco: 'kano-electric',
+  phedc: 'portharcourt-electric',
+  enedc: 'enugu-electric',
+  bedc: 'benin-electric',
+  yedc: 'yola-electric',
+  josedc: 'jos-electric'
+};
 
 // Nigerian Service Providers
 const PROVIDERS = {
@@ -151,6 +166,46 @@ async function createBillNotification({ user, transaction, amount, detail }) {
   });
 }
 
+async function completeBillPayment({
+  userId,
+  amount,
+  reference,
+  type,
+  description,
+  metadata
+}) {
+  return withTransaction(async (session) => {
+    const sessionUser = await User.findById(userId).session(session);
+    if (!sessionUser) {
+      throw new AppError('User not found', 404);
+    }
+
+    if (Number(sessionUser.balances.NGN || 0) < Number(amount)) {
+      throw new AppError('Insufficient NGN balance', 400);
+    }
+
+    const transaction = new Transaction({
+      userId,
+      type,
+      amount,
+      currency: 'NGN',
+      description,
+      status: 'completed',
+      reference,
+      metadata
+    });
+
+    sessionUser.balances.NGN = Number((Number(sessionUser.balances.NGN || 0) - Number(amount)).toFixed(2));
+
+    await Promise.all([
+      transaction.save({ session }),
+      sessionUser.save({ session })
+    ]);
+
+    return { user: sessionUser, transaction };
+  });
+}
+
 // Get all providers
 router.get('/providers', authMiddleware, (req, res) => {
   res.json({
@@ -254,7 +309,7 @@ router.post('/validate-meter', authMiddleware, [
       customerInfo
     });
   } catch (error) {
-    res.status(500).json({ message: 'Server error' });
+    res.status(error.statusCode || 500).json({ message: error.message || 'Server error' });
   }
 });
 
@@ -291,7 +346,7 @@ router.post('/validate-smartcard', authMiddleware, [
       customerInfo
     });
   } catch (error) {
-    res.status(500).json({ message: 'Server error' });
+    res.status(error.statusCode || 500).json({ message: error.message || 'Server error' });
   }
 });
 
@@ -335,7 +390,7 @@ router.post('/validate-phone', authMiddleware, [
       formattedNumber: cleaned.length === 11 ? '+234' + cleaned.slice(1) : '+' + cleaned
     });
   } catch (error) {
-    res.status(500).json({ message: 'Server error' });
+    res.status(error.statusCode || 500).json({ message: error.message || 'Server error' });
   }
 });
 
@@ -368,41 +423,41 @@ router.post('/airtime', authMiddleware, requireVerifiedKycForTransactions, [
     const providerName = PROVIDERS.airtime.find(p => p.id === provider)?.name || provider;
 
     // Try VTpass first, fallback to mock if not configured
-    let vtpassResult = null;
-    if (vtpassService.isConfigured) {
-      const auth = await vtpassService.getAuthToken();
-      if (auth.success) {
-        vtpassResult = await vtpassService.buyAirtime({
-          phone: phoneNumber,
-          amount,
-          network: provider,
-          token: auth.token
-        });
-      }
+    if (!vtpassService.isConfigured) {
+      return res.status(503).json({ message: 'Bill payment service is not configured' });
     }
 
-    const transaction = new Transaction({
-      userId: req.userId,
-      type: 'airtime',
+    const auth = await vtpassService.getAuthToken();
+    if (!auth.success) {
+      return res.status(502).json({ message: auth.error || 'Unable to authenticate bill payment service' });
+    }
+
+    const vtpassResult = await vtpassService.buyAirtime({
+      phone: phoneNumber,
       amount,
-      currency: 'NGN',
-      description: `${providerName} airtime for ${phoneNumber}`,
-      status: vtpassResult?.success ? 'completed' : 'completed',
+      network: provider,
+      token: auth.token
+    });
+    if (!vtpassResult.success) {
+      return res.status(502).json({ message: vtpassResult.error || 'Airtime provider request failed' });
+    }
+
+    const { user: updatedUser, transaction } = await completeBillPayment({
+      userId: req.userId,
+      amount,
       reference,
-      metadata: { 
-        provider, 
-        phoneNumber, 
+      type: 'airtime',
+      description: `${providerName} airtime for ${phoneNumber}`,
+      metadata: {
+        provider,
+        phoneNumber,
         billType: 'airtime',
         vtpassResponse: vtpassResult
       }
     });
-    await transaction.save();
-
-    user.balances.NGN -= amount;
-    await user.save();
 
     await createBillNotification({
-      user,
+      user: updatedUser,
       transaction,
       amount,
       detail: `${providerName} airtime for ${phoneNumber}`
@@ -412,7 +467,7 @@ router.post('/airtime', authMiddleware, requireVerifiedKycForTransactions, [
       success: true,
       message: 'Airtime purchase successful',
       reference,
-      newBalance: user.balances.NGN,
+      newBalance: updatedUser.balances.NGN,
       details: {
         provider: providerName,
         phoneNumber,
@@ -420,7 +475,7 @@ router.post('/airtime', authMiddleware, requireVerifiedKycForTransactions, [
       }
     });
   } catch (error) {
-    res.status(500).json({ message: 'Server error' });
+    res.status(error.statusCode || 500).json({ message: error.message || 'Server error' });
   }
 });
 
@@ -458,43 +513,43 @@ router.post('/data', authMiddleware, requireVerifiedKycForTransactions, [
     const providerName = PROVIDERS.data.find(p => p.id === provider)?.name || provider;
 
     // Try VTpass first, fallback to mock if not configured
-    let vtpassResult = null;
-    if (vtpassService.isConfigured) {
-      const auth = await vtpassService.getAuthToken();
-      if (auth.success) {
-        vtpassResult = await vtpassService.buyData({
-          phone: phoneNumber,
-          amount: plan.amount,
-          network: provider,
-          variationCode: planId,
-          token: auth.token
-        });
-      }
+    if (!vtpassService.isConfigured) {
+      return res.status(503).json({ message: 'Bill payment service is not configured' });
     }
 
-    const transaction = new Transaction({
-      userId: req.userId,
-      type: 'data',
+    const auth = await vtpassService.getAuthToken();
+    if (!auth.success) {
+      return res.status(502).json({ message: auth.error || 'Unable to authenticate bill payment service' });
+    }
+
+    const vtpassResult = await vtpassService.buyData({
+      phone: phoneNumber,
       amount: plan.amount,
-      currency: 'NGN',
-      description: `${plan.name} ${providerName} data for ${phoneNumber}`,
-      status: vtpassResult?.success ? 'completed' : 'completed',
+      network: provider,
+      variationCode: planId,
+      token: auth.token
+    });
+    if (!vtpassResult.success) {
+      return res.status(502).json({ message: vtpassResult.error || 'Data provider request failed' });
+    }
+
+    const { user: updatedUser, transaction } = await completeBillPayment({
+      userId: req.userId,
+      amount: plan.amount,
       reference,
-      metadata: { 
-        provider, 
-        phoneNumber, 
-        plan, 
+      type: 'data',
+      description: `${plan.name} ${providerName} data for ${phoneNumber}`,
+      metadata: {
+        provider,
+        phoneNumber,
+        plan,
         billType: 'data',
         vtpassResponse: vtpassResult
       }
     });
-    await transaction.save();
-
-    user.balances.NGN -= plan.amount;
-    await user.save();
 
     await createBillNotification({
-      user,
+      user: updatedUser,
       transaction,
       amount: plan.amount,
       detail: `${plan.name} ${providerName} data for ${phoneNumber}`
@@ -504,7 +559,7 @@ router.post('/data', authMiddleware, requireVerifiedKycForTransactions, [
       success: true,
       message: 'Data purchase successful',
       reference,
-      newBalance: user.balances.NGN,
+      newBalance: updatedUser.balances.NGN,
       details: {
         provider: providerName,
         phoneNumber,
@@ -514,7 +569,7 @@ router.post('/data', authMiddleware, requireVerifiedKycForTransactions, [
       }
     });
   } catch (error) {
-    res.status(500).json({ message: 'Server error' });
+    res.status(error.statusCode || 500).json({ message: error.message || 'Server error' });
   }
 });
 
@@ -546,29 +601,47 @@ router.post('/electricity', authMiddleware, requireVerifiedKycForTransactions, [
 
     const reference = `ELEC-${Date.now()}`;
     const providerName = PROVIDERS.electricity.find(p => p.id === provider)?.name || provider;
+    const vtpassServiceId = ELECTRICITY_SERVICE_IDS[provider];
+
+    if (!vtpassService.isConfigured) {
+      return res.status(503).json({ message: 'Bill payment service is not configured' });
+    }
+    if (!vtpassServiceId) {
+      return res.status(400).json({ message: 'Unsupported electricity provider' });
+    }
+
+    const auth = await vtpassService.getAuthToken();
+    if (!auth.success) {
+      return res.status(502).json({ message: auth.error || 'Unable to authenticate bill payment service' });
+    }
+
+    const vtpassResult = await vtpassService.payElectricity({
+      disco: vtpassServiceId,
+      meterNumber,
+      amount,
+      phone: user.phone,
+      token: auth.token
+    });
+    if (!vtpassResult.success) {
+      return res.status(502).json({ message: vtpassResult.error || 'Electricity provider request failed' });
+    }
 
     // Generate token for prepaid meters
     const token = meterType === 'prepaid' 
       ? Array(20).fill(0).map(() => Math.floor(Math.random() * 10)).join('')
       : null;
 
-    const transaction = new Transaction({
+    const { user: updatedUser, transaction } = await completeBillPayment({
       userId: req.userId,
-      type: 'electricity',
       amount,
-      currency: 'NGN',
-      description: `${providerName} ${meterType} payment`,
-      status: 'completed',
       reference,
-      metadata: { provider, meterNumber, meterType, token, billType: 'electricity' }
+      type: 'electricity',
+      description: `${providerName} ${meterType} payment`,
+      metadata: { provider, meterNumber, meterType, token, billType: 'electricity', vtpassResponse: vtpassResult }
     });
-    await transaction.save();
-
-    user.balances.NGN -= amount;
-    await user.save();
 
     await createBillNotification({
-      user,
+      user: updatedUser,
       transaction,
       amount,
       detail: `${providerName} ${meterType} electricity bill`
@@ -578,7 +651,7 @@ router.post('/electricity', authMiddleware, requireVerifiedKycForTransactions, [
       success: true,
       message: 'Electricity payment successful',
       reference,
-      newBalance: user.balances.NGN,
+      newBalance: updatedUser.balances.NGN,
       details: {
         provider: providerName,
         meterNumber,
@@ -588,7 +661,7 @@ router.post('/electricity', authMiddleware, requireVerifiedKycForTransactions, [
       }
     });
   } catch (error) {
-    res.status(500).json({ message: 'Server error' });
+    res.status(error.statusCode || 500).json({ message: error.message || 'Server error' });
   }
 });
 
@@ -625,23 +698,38 @@ router.post('/cable', authMiddleware, requireVerifiedKycForTransactions, [
     const reference = `CABLE-${Date.now()}`;
     const providerName = PROVIDERS.cable.find(p => p.id === provider)?.name || provider;
 
-    const transaction = new Transaction({
-      userId: req.userId,
-      type: 'cable',
-      amount: package_.amount,
-      currency: 'NGN',
-      description: `${providerName} ${package_.name} subscription`,
-      status: 'completed',
-      reference,
-      metadata: { provider, smartCardNumber, package: package_, billType: 'cable' }
-    });
-    await transaction.save();
+    if (!vtpassService.isConfigured) {
+      return res.status(503).json({ message: 'Bill payment service is not configured' });
+    }
 
-    user.balances.NGN -= package_.amount;
-    await user.save();
+    const auth = await vtpassService.getAuthToken();
+    if (!auth.success) {
+      return res.status(502).json({ message: auth.error || 'Unable to authenticate bill payment service' });
+    }
+
+    const vtpassResult = await vtpassService.payCableTv({
+      service: provider,
+      smartCardNumber,
+      amount: package_.amount,
+      variationCode: packageId,
+      phone: user.phone,
+      token: auth.token
+    });
+    if (!vtpassResult.success) {
+      return res.status(502).json({ message: vtpassResult.error || 'Cable provider request failed' });
+    }
+
+    const { user: updatedUser, transaction } = await completeBillPayment({
+      userId: req.userId,
+      amount: package_.amount,
+      reference,
+      type: 'cable',
+      description: `${providerName} ${package_.name} subscription`,
+      metadata: { provider, smartCardNumber, package: package_, billType: 'cable', vtpassResponse: vtpassResult }
+    });
 
     await createBillNotification({
-      user,
+      user: updatedUser,
       transaction,
       amount: package_.amount,
       detail: `${providerName} ${package_.name} subscription`
@@ -651,7 +739,7 @@ router.post('/cable', authMiddleware, requireVerifiedKycForTransactions, [
       success: true,
       message: 'Cable TV subscription successful',
       reference,
-      newBalance: user.balances.NGN,
+      newBalance: updatedUser.balances.NGN,
       details: {
         provider: providerName,
         smartCardNumber,
@@ -660,7 +748,7 @@ router.post('/cable', authMiddleware, requireVerifiedKycForTransactions, [
       }
     });
   } catch (error) {
-    res.status(500).json({ message: 'Server error' });
+    res.status(error.statusCode || 500).json({ message: error.message || 'Server error' });
   }
 });
 
@@ -692,23 +780,17 @@ router.post('/betting', authMiddleware, requireVerifiedKycForTransactions, [
     const reference = `BET-${Date.now()}`;
     const providerName = PROVIDERS.betting.find(p => p.id === provider)?.name || provider;
 
-    const transaction = new Transaction({
+    const { user: updatedUser, transaction } = await completeBillPayment({
       userId: req.userId,
-      type: 'betting',
       amount,
-      currency: 'NGN',
-      description: `${providerName} deposit`,
-      status: 'completed',
       reference,
+      type: 'betting',
+      description: `${providerName} deposit`,
       metadata: { provider, accountId, billType: 'betting' }
     });
-    await transaction.save();
-
-    user.balances.NGN -= amount;
-    await user.save();
 
     await createBillNotification({
-      user,
+      user: updatedUser,
       transaction,
       amount,
       detail: `${providerName} betting deposit`
@@ -718,7 +800,7 @@ router.post('/betting', authMiddleware, requireVerifiedKycForTransactions, [
       success: true,
       message: 'Betting deposit successful',
       reference,
-      newBalance: user.balances.NGN,
+      newBalance: updatedUser.balances.NGN,
       details: {
         provider: providerName,
         accountId,
@@ -726,7 +808,7 @@ router.post('/betting', authMiddleware, requireVerifiedKycForTransactions, [
       }
     });
   } catch (error) {
-    res.status(500).json({ message: 'Server error' });
+    res.status(error.statusCode || 500).json({ message: error.message || 'Server error' });
   }
 });
 
@@ -740,7 +822,7 @@ router.get('/giftcard-rates', authMiddleware, async (req, res) => {
       supportedCards: config.supportedCards
     });
   } catch (error) {
-    res.status(500).json({ message: 'Server error' });
+    res.status(error.statusCode || 500).json({ message: error.message || 'Server error' });
   }
 });
 
@@ -854,7 +936,7 @@ router.post('/giftcard-trade', authMiddleware, requireVerifiedKycForTransactions
       }
     });
   } catch (error) {
-    res.status(500).json({ message: 'Server error' });
+    res.status(error.statusCode || 500).json({ message: error.message || 'Server error' });
   }
 });
 
@@ -863,7 +945,7 @@ router.get('/giftcard-trades', authMiddleware, async (req, res) => {
     const trades = await GiftCardTrade.find({ userId: req.userId }).sort({ createdAt: -1 }).limit(100);
     res.json({ success: true, trades });
   } catch (error) {
-    res.status(500).json({ message: 'Server error' });
+    res.status(error.statusCode || 500).json({ message: error.message || 'Server error' });
   }
 });
 
@@ -897,7 +979,7 @@ router.get('/history', authMiddleware, async (req, res) => {
       }
     });
   } catch (error) {
-    res.status(500).json({ message: 'Server error' });
+    res.status(error.statusCode || 500).json({ message: error.message || 'Server error' });
   }
 });
 

@@ -12,6 +12,13 @@ const { withTransaction } = require('../utils/database');
 const { storeOTP, sendOTPEmail, verifyOTP, requires2FA } = require('../utils/twoFA');
 const Logger = require('../utils/logger');
 
+function getAvailableBalance(user, currency) {
+  const currencyUpper = String(currency || '').toUpperCase();
+  const balance = Number(user?.balances?.[currencyUpper] || 0);
+  const locked = Number(user?.lockedBalances?.[currencyUpper] || 0);
+  return Math.max(0, balance - locked);
+}
+
 // Validate username
 router.get('/validate-username/:username', authMiddleware, asyncHandler(async (req, res) => {
   const user = await User.findOne({ 
@@ -45,7 +52,8 @@ router.post('/request-otp', authMiddleware, requireVerifiedKycForTransactions, [
     return res.status(400).json({ errors: errors.array() });
   }
 
-  const { toUsername, amount, currency } = req.body;
+  const { toUsername, currency } = req.body;
+  const amount = Number(req.body.amount);
   const sender = await User.findById(req.userId);
 
   // Check if 2FA is required
@@ -92,7 +100,8 @@ router.post('/username', authMiddleware, requireVerifiedKycForTransactions, [
     return res.status(400).json({ errors: errors.array() });
   }
 
-  const { toUsername, amount, currency, chainId = 'solana', description = '', pin, otp } = req.body;
+  const { toUsername, currency, chainId = 'solana', description = '', pin, otp } = req.body;
+  const amount = Number(req.body.amount);
   const currencyUpper = currency.toUpperCase();
   
   let sender = await User.findById(req.userId);
@@ -104,9 +113,7 @@ router.post('/username', authMiddleware, requireVerifiedKycForTransactions, [
   }
 
   // Check sender balance (including locked balances)
-  const senderBalance = sender.balances[currencyUpper] || 0;
-  const senderLockedBalance = sender.lockedBalances?.[currencyUpper] || 0;
-  const senderAvailableBalance = senderBalance - senderLockedBalance;
+  const senderAvailableBalance = getAvailableBalance(sender, currencyUpper);
 
   if (senderAvailableBalance < amount) {
     throw new AppError(
@@ -139,106 +146,126 @@ router.post('/username', authMiddleware, requireVerifiedKycForTransactions, [
     sender = await User.findById(req.userId); // Refresh sender after OTP verification
   }
 
-  const fee = Math.max(0.01, amount * 0.001); // 0.1% fee, minimum 0.01
-  const netAmount = amount - fee;
+  const fee = Number(Math.max(0.01, amount * 0.001).toFixed(8)); // 0.1% fee, minimum 0.01
+  const netAmount = Number((amount - fee).toFixed(8));
+  if (netAmount <= 0) {
+    throw new AppError('Transfer amount is too small after fees', 400);
+  }
   const reference = `TRF-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
 
   // Use transaction to ensure atomicity
   return withTransaction(async (session) => {
+    const [sessionSender, sessionRecipient] = await Promise.all([
+      User.findById(sender._id).session(session),
+      User.findById(recipient._id).session(session)
+    ]);
+
+    if (!sessionSender || !sessionRecipient) {
+      throw new AppError('Unable to load transfer participants', 404);
+    }
+
+    if (getAvailableBalance(sessionSender, currencyUpper) < amount) {
+      throw new AppError(
+        `Insufficient available ${currencyUpper} balance. Available: ${getAvailableBalance(sessionSender, currencyUpper)}, Required: ${amount}`,
+        400
+      );
+    }
+
     // Deduct from sender
-    sender.balances[currencyUpper] -= amount;
+    sessionSender.balances[currencyUpper] = Number((Number(sessionSender.balances[currencyUpper] || 0) - amount).toFixed(8));
     
     // Add to recipient
-    recipient.balances[currencyUpper] = (recipient.balances[currencyUpper] || 0) + netAmount;
+    sessionRecipient.balances[currencyUpper] = Number((Number(sessionRecipient.balances[currencyUpper] || 0) + netAmount).toFixed(8));
 
     // Create transfer record
     const transfer = new UserTransfer({
-      fromUserId: sender._id,
-      fromUsername: sender.username || sender.email,
-      toUserId: recipient._id,
-      toUsername: recipient.username,
+      fromUserId: sessionSender._id,
+      fromUsername: sessionSender.username || sessionSender.email,
+      toUserId: sessionRecipient._id,
+      toUsername: sessionRecipient.username,
       amount: netAmount,
       currency: currencyUpper,
       chainId,
       fee,
       description,
       reference,
-      status: 'completed'
+      status: 'completed',
+      completedAt: new Date()
     });
 
     // Create separate transaction records (with unique references)
     const senderTx = new Transaction({
-      userId: sender._id,
+      userId: sessionSender._id,
       type: 'user_transfer_sent',
       amount,
       currency: currencyUpper,
-      description: `Transfer to @${recipient.username}`,
+      description: `Transfer to @${sessionRecipient.username}`,
       status: 'completed',
-      toUserId: recipient._id,
-      toUsername: recipient.username,
+      toUserId: sessionRecipient._id,
+      toUsername: sessionRecipient.username,
       fee,
       reference: `${reference}-SEND`,
       metadata: {
         transferId: transfer._id,
         netAmount,
-        recipientUsername: recipient.username
+        recipientUsername: sessionRecipient.username
       }
     });
 
     const recipientTx = new Transaction({
-      userId: recipient._id,
+      userId: sessionRecipient._id,
       type: 'user_transfer_received',
       amount: netAmount,
       currency: currencyUpper,
-      description: `Transfer from @${sender.username || sender.email}`,
+      description: `Transfer from @${sessionSender.username || sessionSender.email}`,
       status: 'completed',
-      fromUserId: sender._id,
-      fromUsername: sender.username || sender.email,
+      fromUserId: sessionSender._id,
+      fromUsername: sessionSender.username || sessionSender.email,
       reference: `${reference}-RECEIVE`,
       metadata: {
         transferId: transfer._id,
-        senderUsername: sender.username
+        senderUsername: sessionSender.username
       }
     });
 
     await Promise.all([
       transfer.save({ session }),
-      sender.save({ session }),
-      recipient.save({ session }),
+      sessionSender.save({ session }),
+      sessionRecipient.save({ session }),
       senderTx.save({ session }),
       recipientTx.save({ session })
     ]);
 
-    logger.info(`Transfer completed: ${reference}, sender: ${sender._id}, recipient: ${recipient._id}, amount: ${amount} ${currencyUpper}`);
+    logger.info(`Transfer completed: ${reference}, sender: ${sessionSender._id}, recipient: ${sessionRecipient._id}, amount: ${amount} ${currencyUpper}`);
 
     // Send notifications
     await Promise.all([
       createNotification({
-        user: sender,
+        user: sessionSender,
         type: 'send',
         title: 'Transfer sent',
-        body: `You sent ${amount} ${currencyUpper} to @${recipient.username}.`,
+        body: `You sent ${amount} ${currencyUpper} to @${sessionRecipient.username}.`,
         data: {
           reference,
           amount,
           fee,
           currency: currencyUpper,
           transactionId: senderTx._id,
-          username: recipient.username
+          username: sessionRecipient.username
         },
         sendEmail: true
       }),
       createNotification({
-        user: recipient,
+        user: sessionRecipient,
         type: 'receive',
         title: 'Transfer received',
-        body: `You received ${netAmount} ${currencyUpper} from @${sender.username || sender.email}.`,
+        body: `You received ${netAmount} ${currencyUpper} from @${sessionSender.username || sessionSender.email}.`,
         data: {
           reference,
           amount: netAmount,
           currency: currencyUpper,
           transactionId: recipientTx._id,
-          username: sender.username || sender.email
+          username: sessionSender.username || sessionSender.email
         },
         sendEmail: true
       })
@@ -252,10 +279,10 @@ router.post('/username', authMiddleware, requireVerifiedKycForTransactions, [
       fee,
       netAmount,
       recipient: {
-        username: recipient.username,
-        name: `${recipient.firstName} ${recipient.lastName}`
+        username: sessionRecipient.username,
+        name: `${sessionRecipient.firstName} ${sessionRecipient.lastName}`
       },
-      newBalance: sender.balances[currencyUpper]
+      newBalance: sessionSender.balances[currencyUpper]
     });
   });
 }));

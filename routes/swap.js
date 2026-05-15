@@ -6,6 +6,8 @@ const User = require('../models/User');
 const Transaction = require('../models/Transaction');
 const axios = require('axios');
 const lifiService = require('../services/lifi');
+const { withTransaction } = require('../utils/database');
+const { AppError } = require('../utils/errorHandler');
 
 const JUPITER_API = 'https://quote-api.jup.ag/v6';
 const EVM_NATIVE_TOKEN = '0x0000000000000000000000000000000000000000';
@@ -44,6 +46,13 @@ router.get('/tokens', authMiddleware, async (req, res) => {
 });
 
 const getTokenDecimals = (chain, symbolOrAddress) => getTokenConfig(chain, symbolOrAddress)?.decimals || 18;
+
+const getAvailableBalance = (user, asset) => {
+  const symbol = String(asset || '').toUpperCase();
+  const balance = Number(user?.balances?.[symbol] || 0);
+  const locked = Number(user?.lockedBalances?.[symbol] || 0);
+  return Math.max(0, balance - locked);
+};
 
 const toBaseUnits = (amount, decimals) => {
   const numericAmount = Number(amount);
@@ -198,44 +207,71 @@ router.post('/execute', authMiddleware, [
     } = req.body;
     const user = await User.findById(req.userId);
     const debitAmount = Number(fromAmount || amount);
+    const creditAmount = Number(toAmount);
+    const fromSymbol = String(fromToken).toUpperCase();
+    const toSymbol = String(toToken).toUpperCase();
 
     if (!debitAmount || debitAmount <= 0) {
       return res.status(400).json({ message: 'Invalid swap amount' });
     }
 
-    const currentBalance = user.balances[fromToken.toUpperCase()] || 0;
+    if (!creditAmount || creditAmount <= 0) {
+      return res.status(400).json({ message: 'Invalid output amount' });
+    }
+
+    if (fromSymbol === toSymbol && fromChain === toChain) {
+      return res.status(400).json({ message: 'Source and destination asset cannot be the same' });
+    }
+
+    const currentBalance = getAvailableBalance(user, fromSymbol);
 
     if (currentBalance < debitAmount) {
-      return res.status(400).json({ message: `Insufficient ${fromToken} balance` });
+      return res.status(400).json({ message: `Insufficient available ${fromToken} balance` });
     }
 
     const reference = `SWAP-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
 
-    const transaction = new Transaction({
-      userId: req.userId,
-      type: fromChain === toChain ? 'swap' : 'cross_chain_swap',
-      amount: debitAmount,
-      currency: fromToken,
-      chainId: fromChain,
-      fromCurrency: fromToken,
-      toCurrency: toToken,
-      fromAmount: debitAmount,
-      toAmount,
-      fromChainId: fromChain,
-      toChainId: toChain,
-      description: `Swap ${debitAmount} ${fromToken} to ${toToken}`,
-      status: 'completed',
-      reference
+    const { transaction } = await withTransaction(async (session) => {
+      const sessionUser = await User.findById(user._id).session(session);
+      if (!sessionUser) {
+        throw new AppError('User not found', 404);
+      }
+
+      const sessionAvailableBalance = getAvailableBalance(sessionUser, fromSymbol);
+      if (sessionAvailableBalance < debitAmount) {
+        throw new AppError(`Insufficient available ${fromToken} balance`, 400);
+      }
+
+      const transaction = new Transaction({
+        userId: req.userId,
+        type: fromChain === toChain ? 'swap' : 'cross_chain_swap',
+        amount: debitAmount,
+        currency: fromSymbol,
+        chainId: fromChain,
+        fromCurrency: fromSymbol,
+        toCurrency: toSymbol,
+        fromAmount: debitAmount,
+        toAmount: creditAmount,
+        fromChainId: fromChain,
+        toChainId: toChain,
+        description: `Swap ${debitAmount} ${fromSymbol} to ${toSymbol}`,
+        status: 'completed',
+        reference,
+        metadata: {
+          executionMode: fromChain === toChain ? 'internal_ledger_swap' : 'internal_ledger_cross_chain_credit'
+        }
+      });
+
+      sessionUser.balances[fromSymbol] = Number((Number(sessionUser.balances[fromSymbol] || 0) - debitAmount).toFixed(8));
+      sessionUser.balances[toSymbol] = Number((Number(sessionUser.balances[toSymbol] || 0) + creditAmount).toFixed(8));
+
+      await Promise.all([
+        sessionUser.save({ session }),
+        transaction.save({ session })
+      ]);
+
+      return { transaction };
     });
-
-    user.balances[fromToken.toUpperCase()] = currentBalance - debitAmount;
-    if (toToken && typeof toAmount === 'number') {
-      user.balances[toToken.toUpperCase()] =
-        (user.balances[toToken.toUpperCase()] || 0) + toAmount;
-    }
-
-    await user.save();
-    await transaction.save();
 
     res.json({
       message: 'Swap completed',
@@ -247,7 +283,7 @@ router.post('/execute', authMiddleware, [
       }
     });
   } catch (error) {
-    res.status(500).json({ message: 'Server error' });
+    res.status(error.statusCode || 500).json({ message: error.message || 'Server error' });
   }
 });
 
