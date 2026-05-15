@@ -26,8 +26,18 @@ const authMiddleware = async (req, res, next) => {
   }
 };
 
+const requireTransactionPinSet = (req, res, next) => {
+  if (!req.user?.pin) {
+    return res.status(403).json({
+      message: 'Set your transaction PIN before performing this action'
+    });
+  }
+
+  next();
+};
+
 const generateToken = (userId) => {
   return jwt.sign({ userId }, JWT_SECRET, { expiresIn: '7d' });
 };
 
-module.exports = { authMiddleware, generateToken, JWT_SECRET };
+module.exports = { authMiddleware, requireTransactionPinSet, generateToken, JWT_SECRET };

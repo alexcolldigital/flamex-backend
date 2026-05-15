@@ -1,7 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const { body, validationResult } = require('express-validator');
-const { authMiddleware } = require('../middleware/auth');
+const { authMiddleware, requireTransactionPinSet } = require('../middleware/auth');
 const User = require('../models/User');
 const Transaction = require('../models/Transaction');
 const flutterwaveService = require('../services/flutterwave');
@@ -93,7 +93,7 @@ router.post('/verify-account', authMiddleware, [
   });
 }));
 
-router.post('/ngn/request-otp', authMiddleware, requireVerifiedKycForTransactions, [
+router.post('/ngn/request-otp', authMiddleware, requireTransactionPinSet, requireVerifiedKycForTransactions, [
   body('amount').isFloat({ min: 500 })
 ], asyncHandler(async (req, res) => {
   const logger = new Logger('withdrawal/ngn/request-otp');
@@ -124,7 +124,7 @@ router.post('/ngn/request-otp', authMiddleware, requireVerifiedKycForTransaction
   });
 }));
 
-router.post('/ngn', authMiddleware, requireVerifiedKycForTransactions, [
+router.post('/ngn', authMiddleware, requireTransactionPinSet, requireVerifiedKycForTransactions, [
   body('amount').isFloat({ min: 500 }),
   body('bankCode').notEmpty().withMessage('Bank code required'),
   body('accountNumber').isLength({ min: 10, max: 10 }).withMessage('Invalid account number'),
@@ -294,7 +294,7 @@ router.post('/ngn', authMiddleware, requireVerifiedKycForTransactions, [
   });
 }));
 
-router.post('/crypto/request-otp', authMiddleware, requireVerifiedKycForTransactions, [
+router.post('/crypto/request-otp', authMiddleware, requireTransactionPinSet, requireVerifiedKycForTransactions, [
   body('amount').isFloat({ min: 0.000001 })
 ], asyncHandler(async (req, res) => {
   const logger = new Logger('withdrawal/crypto/request-otp');
@@ -321,7 +321,7 @@ router.post('/crypto/request-otp', authMiddleware, requireVerifiedKycForTransact
   });
 }));
 
-router.post('/crypto', authMiddleware, requireVerifiedKycForTransactions, [
+router.post('/crypto', authMiddleware, requireTransactionPinSet, requireVerifiedKycForTransactions, [
   body('chainId').notEmpty().withMessage('Chain ID required'),
   body('token').notEmpty().withMessage('Token required'),
   body('amount').isFloat({ min: 0.000001 }).withMessage('Invalid amount'),

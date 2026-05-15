@@ -1,7 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const { body, validationResult } = require('express-validator');
-const { authMiddleware } = require('../middleware/auth');
+const { authMiddleware, requireTransactionPinSet } = require('../middleware/auth');
 const User = require('../models/User');
 const Transaction = require('../models/Transaction');
 const GiftCardTrade = require('../models/GiftCardTrade');
@@ -395,7 +395,7 @@ router.post('/validate-phone', authMiddleware, [
 });
 
 // Buy Airtime
-router.post('/airtime', authMiddleware, requireVerifiedKycForTransactions, [
+router.post('/airtime', authMiddleware, requireTransactionPinSet, requireVerifiedKycForTransactions, [
   body('provider').notEmpty(),
   body('phoneNumber').notEmpty(),
   body('amount').isFloat({ min: 50, max: 50000 }),
@@ -480,7 +480,7 @@ router.post('/airtime', authMiddleware, requireVerifiedKycForTransactions, [
 });
 
 // Buy Data
-router.post('/data', authMiddleware, requireVerifiedKycForTransactions, [
+router.post('/data', authMiddleware, requireTransactionPinSet, requireVerifiedKycForTransactions, [
   body('provider').notEmpty(),
   body('phoneNumber').notEmpty(),
   body('planId').notEmpty(),
@@ -574,7 +574,7 @@ router.post('/data', authMiddleware, requireVerifiedKycForTransactions, [
 });
 
 // Pay Electricity Bill
-router.post('/electricity', authMiddleware, requireVerifiedKycForTransactions, [
+router.post('/electricity', authMiddleware, requireTransactionPinSet, requireVerifiedKycForTransactions, [
   body('provider').notEmpty(),
   body('meterNumber').notEmpty(),
   body('meterType').isIn(['prepaid', 'postpaid']),
@@ -666,7 +666,7 @@ router.post('/electricity', authMiddleware, requireVerifiedKycForTransactions, [
 });
 
 // Pay Cable TV
-router.post('/cable', authMiddleware, requireVerifiedKycForTransactions, [
+router.post('/cable', authMiddleware, requireTransactionPinSet, requireVerifiedKycForTransactions, [
   body('provider').notEmpty(),
   body('smartCardNumber').notEmpty(),
   body('packageId').notEmpty(),
@@ -753,7 +753,7 @@ router.post('/cable', authMiddleware, requireVerifiedKycForTransactions, [
 });
 
 // Betting Deposit
-router.post('/betting', authMiddleware, requireVerifiedKycForTransactions, [
+router.post('/betting', authMiddleware, requireTransactionPinSet, requireVerifiedKycForTransactions, [
   body('provider').notEmpty(),
   body('accountId').notEmpty(),
   body('amount').isFloat({ min: 100, max: 1000000 }),
@@ -827,7 +827,7 @@ router.get('/giftcard-rates', authMiddleware, async (req, res) => {
 });
 
 // Submit gift card trade
-router.post('/giftcard-trade', authMiddleware, requireVerifiedKycForTransactions, [
+router.post('/giftcard-trade', authMiddleware, requireTransactionPinSet, requireVerifiedKycForTransactions, [
   body('brand').notEmpty(),
   body('country').notEmpty(),
   body('currency').notEmpty(),

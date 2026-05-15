@@ -1,7 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const { body, validationResult } = require('express-validator');
-const { authMiddleware } = require('../middleware/auth');
+const { authMiddleware, requireTransactionPinSet } = require('../middleware/auth');
 const User = require('../models/User');
 const UserTransfer = require('../models/UserTransfer');
 const Transaction = require('../models/Transaction');
@@ -40,7 +40,7 @@ router.get('/validate-username/:username', authMiddleware, asyncHandler(async (r
 }));
 
 // Request 2FA OTP for transfer
-router.post('/request-otp', authMiddleware, requireVerifiedKycForTransactions, [
+router.post('/request-otp', authMiddleware, requireTransactionPinSet, requireVerifiedKycForTransactions, [
   body('toUsername').trim().isLength({ min: 3 }),
   body('amount').isFloat({ min: 0.000001 }),
   body('currency').notEmpty()
@@ -84,7 +84,7 @@ router.post('/request-otp', authMiddleware, requireVerifiedKycForTransactions, [
 }));
 
 // Transfer by username with OTP verification
-router.post('/username', authMiddleware, requireVerifiedKycForTransactions, [
+router.post('/username', authMiddleware, requireTransactionPinSet, requireVerifiedKycForTransactions, [
   body('toUsername').trim().isLength({ min: 3 }).withMessage('Invalid username'),
   body('amount').isFloat({ min: 0.000001 }).withMessage('Invalid amount'),
   body('currency').notEmpty().withMessage('Currency required'),
