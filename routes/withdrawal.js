@@ -93,8 +93,8 @@ router.post('/verify-account', authMiddleware, [
   });
 }));
 
-router.post('/ngn/request-otp', authMiddleware, requireTransactionPinSet, requireVerifiedKycForTransactions, [
-  body('amount').isFloat({ min: 500 })
+router.post(['/ngn/request-otp', '/usd/request-otp'], authMiddleware, requireTransactionPinSet, requireVerifiedKycForTransactions, [
+  body('amount').isFloat({ min: 1 })
 ], asyncHandler(async (req, res) => {
   const logger = new Logger('withdrawal/ngn/request-otp');
 
@@ -104,9 +104,10 @@ router.post('/ngn/request-otp', authMiddleware, requireTransactionPinSet, requir
   }
 
   const amount = Number(req.body.amount);
+  const currency = req.path.startsWith('/usd/') ? 'USD' : 'NGN';
   const user = await User.findById(req.userId);
 
-  if (getAvailableBalance(user, 'NGN') < amount) {
+  if (getAvailableBalance(user, currency) < amount) {
     throw new AppError('Insufficient balance', 400);
   }
 
@@ -117,15 +118,15 @@ router.post('/ngn/request-otp', authMiddleware, requireTransactionPinSet, requir
   const otp = await storeOTP(user, 'withdrawal');
   await sendOTPEmail(user, otp, 'withdrawal');
 
-  logger.info(`OTP sent for NGN withdrawal of ${amount}`);
+  logger.info(`OTP sent for ${currency} withdrawal of ${amount}`);
   res.json({
     requiresOTP: true,
     message: 'OTP sent to your email'
   });
 }));
 
-router.post('/ngn', authMiddleware, requireTransactionPinSet, requireVerifiedKycForTransactions, [
-  body('amount').isFloat({ min: 500 }),
+router.post(['/ngn', '/usd'], authMiddleware, requireTransactionPinSet, requireVerifiedKycForTransactions, [
+  body('amount').isFloat({ min: 1 }),
   body('bankCode').notEmpty().withMessage('Bank code required'),
   body('accountNumber').isLength({ min: 10, max: 10 }).withMessage('Invalid account number'),
   body('accountName').notEmpty().withMessage('Account name required'),
@@ -139,6 +140,10 @@ router.post('/ngn', authMiddleware, requireTransactionPinSet, requireVerifiedKyc
   }
 
   const amount = Number(req.body.amount);
+  const currency = req.path === '/usd' ? 'USD' : 'NGN';
+  if (currency === 'NGN' && amount < 500) {
+    throw new AppError('Minimum NGN withdrawal is 500', 400);
+  }
   const { bankCode, accountNumber, accountName, pin, otp } = req.body;
   let user = await User.findById(req.userId);
 
@@ -147,7 +152,7 @@ router.post('/ngn', authMiddleware, requireTransactionPinSet, requireVerifiedKyc
     throw new AppError('Invalid PIN', 400);
   }
 
-  if (getAvailableBalance(user, 'NGN') < amount) {
+  if (getAvailableBalance(user, currency) < amount) {
     throw new AppError('Insufficient available balance', 400);
   }
 
@@ -164,12 +169,12 @@ router.post('/ngn', authMiddleware, requireTransactionPinSet, requireVerifiedKyc
     user = await User.findById(req.userId);
   }
 
-  const fee = amount < 10000 ? 50 : 0;
+  const fee = currency === 'NGN' && amount < 10000 ? 50 : 0;
   if (amount <= fee) {
     throw new AppError('Withdrawal amount must be greater than the fee', 400);
   }
 
-  const reference = `WD-NGN-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+  const reference = `WD-${currency}-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
   const bankData = {
     bankCode,
     accountNumber,
@@ -191,7 +196,7 @@ router.post('/ngn', authMiddleware, requireTransactionPinSet, requireVerifiedKyc
       userId: sessionUser._id,
       type: 'withdrawal',
       amount,
-      currency: 'NGN',
+      currency,
       description: `Withdrawal to ${accountName} (${bankData.bankName})`,
       status: 'processing',
       fee,
@@ -203,7 +208,7 @@ router.post('/ngn', authMiddleware, requireTransactionPinSet, requireVerifiedKyc
       }
     });
 
-    sessionUser.balances.NGN = Number((Number(sessionUser.balances.NGN || 0) - amount).toFixed(2));
+    sessionUser.balances[currency] = Number((Number(sessionUser.balances[currency] || 0) - amount).toFixed(currency === 'NGN' ? 2 : 8));
 
     await Promise.all([
       transaction.save({ session }),
@@ -213,7 +218,7 @@ router.post('/ngn', authMiddleware, requireTransactionPinSet, requireVerifiedKyc
     return {
       userId: sessionUser._id,
       transactionId: transaction._id,
-      newBalance: sessionUser.balances.NGN
+      newBalance: sessionUser.balances[currency]
     };
   });
 
@@ -235,7 +240,8 @@ router.post('/ngn', authMiddleware, requireTransactionPinSet, requireVerifiedKyc
       bankCode,
       accountName,
       narration: 'FlameX Withdrawal',
-      reference
+      reference,
+      currency
     });
   } catch (transferError) {
     logger.error(`Flutterwave transfer failed: ${transferError.message}`);
@@ -268,13 +274,13 @@ router.post('/ngn', authMiddleware, requireTransactionPinSet, requireVerifiedKyc
   await createNotification({
     user: notificationUser,
     type: 'send',
-    title: 'NGN withdrawal initiated',
-    body: `Your withdrawal of NGN ${amount.toLocaleString()} to ${accountName} has been initiated.`,
+    title: `${currency} withdrawal initiated`,
+    body: `Your withdrawal of ${currency} ${amount.toLocaleString()} to ${accountName} has been initiated.`,
     data: {
       reference,
       amount,
       fee,
-      currency: 'NGN',
+      currency,
       transactionId: transaction._id,
       status: 'pending'
     },

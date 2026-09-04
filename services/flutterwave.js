@@ -250,7 +250,7 @@ class FlutterwaveService {
       fullName,
       txRef,
       redirectUrl,
-      paymentOptions = 'card,banktransfer,ussd',
+      paymentOptions = 'card,ussd',
       title = 'FlameX Deposit',
       description = 'Deposit to FlameX wallet'
     } = params;

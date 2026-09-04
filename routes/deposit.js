@@ -118,6 +118,7 @@ async function creditNgnDeposit({
     throw new AppError('Invalid deposit amount', 400);
   }
 
+  const currency = String(transaction.currency || 'NGN').toUpperCase();
   transaction.status = 'completed';
   transaction.completedAt = new Date();
   transaction.metadata = {
@@ -139,7 +140,7 @@ async function creditNgnDeposit({
 
   const user = await User.findByIdAndUpdate(
     transaction.userId,
-    { $inc: { 'balances.NGN': normalizedAmount } },
+    { $inc: { [`balances.${currency}`]: normalizedAmount } },
     { new: true, session }
   );
 
@@ -151,11 +152,11 @@ async function creditNgnDeposit({
     user,
     type: 'receive',
     title: 'Deposit confirmed',
-    body: `Your deposit of NGN ${normalizedAmount.toLocaleString()} has been credited to your wallet.`,
+    body: `Your deposit of ${currency} ${normalizedAmount.toLocaleString()} has been credited to your wallet.`,
     data: {
       reference: transaction.reference,
       amount: normalizedAmount,
-      currency: 'NGN',
+      currency,
       transactionId: transaction._id
     },
     sendEmail: true
@@ -172,7 +173,7 @@ async function reconcilePendingDepositsForUser(userId, { limit = 5 } = {}) {
   const pendingTransactions = await Transaction.find({
     userId,
     type: 'deposit',
-    currency: 'NGN',
+    currency: { $in: ['NGN', 'USD'] },
     status: 'pending',
     'metadata.provider': 'flutterwave',
     createdAt: { $gte: new Date(Date.now() - 48 * 60 * 60 * 1000) }
@@ -201,7 +202,7 @@ async function reconcilePendingDepositsForUser(userId, { limit = 5 } = {}) {
 
     if (
       !isSuccessfulFlutterwaveStatus(providerData.status) ||
-      verifiedCurrency !== 'NGN' ||
+      verifiedCurrency !== String(pendingTransaction.currency || 'NGN').toUpperCase() ||
       verifiedReference !== pendingTransaction.reference ||
       verifiedAmount < Number(pendingTransaction.amount || 0)
     ) {
@@ -263,9 +264,10 @@ router.get('/address/:chainId', authMiddleware, asyncHandler(async (req, res) =>
   });
 }));
 
-// Request NGN deposit - Create Flutterwave checkout or virtual account
-router.post('/ngn', authMiddleware, [
-  body('amount').isFloat({ min: 100 }).withMessage('Minimum deposit is NGN 100'),
+// Request fiat deposit - Create a Flutterwave checkout for NGN or USD.
+router.post(['/ngn', '/fiat'], authMiddleware, [
+  body('amount').isFloat({ min: 1 }).withMessage('Deposit amount must be at least 1'),
+  body('currency').optional().isIn(['NGN', 'USD']).withMessage('Currency must be NGN or USD'),
   body('method').optional().isIn(['checkout', 'virtual_account']).withMessage('Method must be either checkout or virtual_account')
 ], asyncHandler(async (req, res) => {
   const logger = new Logger('deposit/ngn');
@@ -277,8 +279,15 @@ router.post('/ngn', authMiddleware, [
 
   const user = await User.findById(req.userId);
   const amount = Number(req.body.amount);
+  const currency = String(req.body.currency || 'NGN').toUpperCase();
   const method = req.body.method || 'checkout';
-  const reference = `DP-NGN-${Date.now()}-${Math.random().toString(36).slice(2, 11)}`;
+  if (currency === 'USD' && method !== 'checkout') {
+    throw new AppError('USD deposits are available through Flutterwave checkout only', 400);
+  }
+  if (currency === 'NGN' && amount < 100) {
+    throw new AppError('Minimum deposit is NGN 100', 400);
+  }
+  const reference = `DP-${currency}-${Date.now()}-${Math.random().toString(36).slice(2, 11)}`;
   const customerName = [user.firstName, user.lastName].filter(Boolean).join(' ').trim();
   const customerBvn = String(user.bvn || '').trim();
   const customerNin = String(user.nin || '').trim();
@@ -304,14 +313,14 @@ router.post('/ngn', authMiddleware, [
         const apiBase = process.env.API_URL || process.env.APP_URL || `${req.protocol}://${req.get('host')}`;
         providerResult = await flutterwaveService.createCheckout({
           amount,
-          currency: 'NGN',
+          currency,
           email: user.email,
           phone: user.phone,
           fullName: customerName,
           txRef: reference,
           redirectUrl: `${apiBase.replace(/\/$/, '')}/api/deposit/callback`,
-          title: 'FlameX NGN Deposit',
-          description: `Deposit NGN ${amount.toLocaleString()} to your FlameX wallet`
+          title: `FlameX ${currency} Deposit`,
+          description: `Deposit ${currency} ${amount.toLocaleString()} to your FlameX wallet`
         });
 
         if (providerResult.success) {
@@ -387,8 +396,8 @@ router.post('/ngn', authMiddleware, [
     userId: req.userId,
     type: 'deposit',
     amount,
-    currency: 'NGN',
-    description: `NGN deposit via Flutterwave ${method === 'checkout' ? 'checkout' : 'bank transfer'}`,
+    currency,
+    description: `${currency} deposit via Flutterwave checkout`,
     status: 'pending',
     reference,
     metadata: {
@@ -465,7 +474,7 @@ router.post('/verify', authMiddleware, [
 
   if (
     !isSuccessfulFlutterwaveStatus(providerData.status) ||
-    verifiedCurrency !== 'NGN' ||
+    verifiedCurrency !== String(transaction.currency || 'NGN').toUpperCase() ||
     verifiedReference !== reference ||
     verifiedAmount < Number(transaction.amount || 0)
   ) {
@@ -558,7 +567,7 @@ router.get('/callback', asyncHandler(async (req, res) => {
 
   if (
     !isSuccessfulFlutterwaveStatus(providerData.status) ||
-    verifiedCurrency !== 'NGN' ||
+    verifiedCurrency !== String(transaction.currency || 'NGN').toUpperCase() ||
     verifiedReference !== reference ||
     verifiedAmount < Number(transaction.amount || 0)
   ) {
@@ -648,7 +657,7 @@ async function handleFlutterwaveWebhook(req, res) {
 
         if (
           !isSuccessfulFlutterwaveStatus(providerData.status) ||
-          verifiedCurrency !== 'NGN' ||
+            verifiedCurrency !== String(transaction.currency || 'NGN').toUpperCase() ||
           verifiedReference !== transaction.reference ||
           verifiedAmount < Number(transaction.amount || 0)
         ) {
