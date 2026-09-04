@@ -16,6 +16,11 @@ validateEnvironment();
 
 const logger = new Logger('Server');
 const app = express();
+const cspConnectSources = [
+  "'self'",
+  ...(process.env.FRONTEND_URL || '').split(','),
+  ...(process.env.ADMIN_FRONTEND_URL || '').split(',')
+].map(origin => origin.trim()).filter(Boolean);
 
 // Security: Helmet middleware
 app.use(helmet({
@@ -25,7 +30,7 @@ app.use(helmet({
       styleSrc: ["'self'", "'unsafe-inline'"],
       scriptSrc: ["'self'"],
       imgSrc: ["'self'", 'data:', 'https:'],
-      connectSrc: ["'self'", process.env.FRONTEND_URL, process.env.ADMIN_FRONTEND_URL].filter(Boolean)
+      connectSrc: cspConnectSources
     }
   },
   referrerPolicy: { policy: 'strict-origin-when-cross-origin' },
