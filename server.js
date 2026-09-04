@@ -39,7 +39,8 @@ app.set('trust proxy', process.env.NODE_ENV === 'production' ? 1 : false);
 const allowedOrigins = [
   ...(process.env.FRONTEND_URL || '').split(','),
   ...(process.env.ADMIN_FRONTEND_URL || '').split(','),
-  ...(process.env.MOBILE_URL || '').split(',')
+  ...(process.env.MOBILE_URL || '').split(','),
+  'https://flamex-omega.vercel.app'
 ].map(origin => origin.trim()).filter(Boolean);
 
 app.use(cors({

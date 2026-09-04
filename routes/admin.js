@@ -179,6 +179,67 @@ router.get('/users/:id', [param('id').isMongoId()], async (req, res) => {
   }
 });
 
+router.put('/users/:id', [
+  param('id').isMongoId(),
+  body('firstName').optional().isString().trim().isLength({ min: 1, max: 80 }),
+  body('lastName').optional().isString().trim().isLength({ min: 1, max: 80 }),
+  body('email').optional().isEmail().normalizeEmail(),
+  body('phone').optional().isString().trim().isLength({ min: 7, max: 30 }),
+  body('username').optional({ nullable: true }).isString().trim().isLength({ min: 3, max: 30 }).matches(/^[a-zA-Z0-9_]+$/),
+  body('emailVerified').optional().isBoolean().toBoolean()
+], async (req, res) => {
+  try {
+    if (!sendValidation(req, res)) return;
+
+    const allowedFields = ['firstName', 'lastName', 'email', 'phone', 'username', 'emailVerified'];
+    const updates = Object.fromEntries(
+      allowedFields.filter((field) => req.body[field] !== undefined).map((field) => [field, req.body[field]])
+    );
+    if (Object.keys(updates).length === 0) {
+      return res.status(400).json({ message: 'At least one editable field is required' });
+    }
+
+    const user = await User.findById(req.params.id);
+    if (!user) return res.status(404).json({ message: 'User not found' });
+
+    Object.assign(user, updates);
+    await user.save();
+    await logAuditEvent(req, {
+      action: 'admin_update_user',
+      entityType: 'user',
+      entityId: user._id,
+      metadata: { fields: Object.keys(updates) }
+    });
+    res.json({ message: 'User updated', user: mapUser(user) });
+  } catch (error) {
+    if (error?.code === 11000) {
+      return res.status(409).json({ message: 'Email, phone, or username is already in use' });
+    }
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+router.delete('/users/:id', [param('id').isMongoId()], async (req, res) => {
+  try {
+    if (!sendValidation(req, res)) return;
+    const user = await User.findById(req.params.id);
+    if (!user) return res.status(404).json({ message: 'User not found' });
+
+    user.status = 'banned';
+    await user.save();
+    await logAuditEvent(req, {
+      action: 'admin_deactivate_user',
+      entityType: 'user',
+      entityId: user._id,
+      severity: 'warning',
+      metadata: { reason: req.body?.reason || 'Deactivated by admin' }
+    });
+    res.json({ message: 'User deactivated', user: mapUser(user) });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
 router.get('/users/:id/transactions', [param('id').isMongoId()], async (req, res) => {
   try {
     if (!sendValidation(req, res)) return;

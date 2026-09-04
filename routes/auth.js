@@ -836,9 +836,20 @@ router.put('/preferences', authMiddleware, async (req, res) => {
 });
 
 // Update security settings
-router.put('/security', authMiddleware, async (req, res) => {
+router.put('/security', authMiddleware, [
+  body('biometricEnabled').optional().isBoolean().toBoolean(),
+  body('transactionConfirmation').optional().isBoolean().toBoolean(),
+  body('autoLockMinutes').optional().isInt({ min: 0, max: 120 }).toInt(),
+  body('twoFactorEnabled').optional().isBoolean().toBoolean()
+], async (req, res) => {
   try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ errors: errors.array() });
+    }
+
     const user = await User.findById(req.userId);
+    if (!user) return res.status(404).json({ message: 'User not found' });
     const {
       biometricEnabled,
       transactionConfirmation,

@@ -183,34 +183,51 @@ class EmailService {
 
     const rowsHtml = rows.map(([label, value], i) => `
       <tr style="background:${i % 2 === 0 ? '#111722' : '#0D1117'}">
-        <td style="padding:12px 20px;color:#94A3B8;font-size:13px;font-family:Arial,sans-serif;white-space:nowrap;width:40%">${label}</td>
-        <td style="padding:12px 20px;color:#FFFFFF;font-size:13px;font-family:Arial,sans-serif;font-weight:600;word-break:break-all">${value}</td>
+        <td style="padding:12px 16px;color:#94A3B8;font-size:13px;font-family:Arial,sans-serif;white-space:nowrap;width:38%;vertical-align:top">${label}</td>
+        <td style="padding:12px 16px;color:#FFFFFF;font-size:13px;font-family:Arial,sans-serif;font-weight:600;word-break:break-all">${value}</td>
       </tr>`
     ).join('');
 
     const html = `<!DOCTYPE html>
-<html>
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
-<body style="margin:0;padding:0;background:#080B12;font-family:Arial,sans-serif">
-  <table width="100%" cellpadding="0" cellspacing="0" style="background:#080B12;padding:32px 16px">
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="x-apple-disable-message-reformatting">
+  <style>
+    @media only screen and (max-width:600px){
+      .outer{padding:12px 6px!important}
+      .card{border-radius:12px!important;width:100%!important}
+      .header-cell{padding:20px 16px!important}
+      .amount-cell{padding:20px 16px!important}
+      .amount-val{font-size:26px!important}
+      .detail-label{font-size:12px!important;padding:10px 12px!important}
+      .detail-value{font-size:12px!important;padding:10px 12px!important}
+      .section-title{padding:12px 14px 6px!important;font-size:12px!important}
+      .footer-cell{padding:14px 16px!important}
+    }
+  </style>
+</head>
+<body style="margin:0;padding:0;background:#080B12;font-family:Arial,sans-serif;-webkit-text-size-adjust:100%">
+  <table class="outer" width="100%" cellpadding="0" cellspacing="0" style="background:#080B12;padding:32px 16px">
     <tr><td align="center">
-      <table width="100%" style="max-width:520px;background:#0D1117;border-radius:16px;overflow:hidden;border:1px solid #1E293B">
+      <table class="card" width="100%" cellpadding="0" cellspacing="0" style="max-width:520px;width:100%;background:#0D1117;border-radius:16px;overflow:hidden;border:1px solid #1E293B">
 
         <!-- Header -->
         <tr>
-          <td style="background:linear-gradient(135deg,#080B12 0%,#111722 100%);padding:28px 24px;text-align:center;border-bottom:1px solid #1E293B">
+          <td class="header-cell" style="background:#111722;padding:28px 24px;text-align:center;border-bottom:1px solid #1E293B">
             <div style="display:inline-block;background:#22C55E;border-radius:12px;padding:8px 18px;margin-bottom:12px">
               <span style="color:#080B12;font-size:20px;font-weight:900;letter-spacing:1px">FlameX</span>
             </div>
-            <p style="color:#94A3B8;margin:0;font-size:13px;letter-spacing:1px;text-transform:uppercase">Transaction Receipt</p>
+            <p style="color:#94A3B8;margin:0;font-size:12px;letter-spacing:1px;text-transform:uppercase">Transaction Receipt</p>
           </td>
         </tr>
 
         <!-- Amount block -->
         <tr>
-          <td style="padding:28px 24px;text-align:center;border-bottom:1px solid #1E293B;background:#111722">
+          <td class="amount-cell" style="padding:28px 24px;text-align:center;border-bottom:1px solid #1E293B;background:#111722">
             <p style="color:#94A3B8;font-size:12px;text-transform:uppercase;letter-spacing:1px;margin:0 0 8px">${typeLabel}</p>
-            <p style="color:${amountColor};font-size:36px;font-weight:900;margin:0 0 12px;letter-spacing:-1px">${sign}${t.amount} ${t.currency}</p>
+            <p class="amount-val" style="color:${amountColor};font-size:36px;font-weight:900;margin:0 0 14px;letter-spacing:-1px;word-break:break-word">${sign}${t.amount} ${t.currency}</p>
             <span style="display:inline-block;padding:5px 16px;border-radius:20px;font-size:12px;font-weight:700;background:${statusBg};color:${statusColor};border:1px solid ${statusColor}">
               ${(t.status || '').toUpperCase()}
             </span>
@@ -221,7 +238,7 @@ class EmailService {
         <tr>
           <td style="padding:0">
             <table width="100%" cellpadding="0" cellspacing="0">
-              <tr><td colspan="2" style="padding:16px 20px 8px;color:#FFFFFF;font-size:14px;font-weight:700;background:#0D1117;border-bottom:1px solid #1E293B">Receipt Details</td></tr>
+              <tr><td class="section-title" colspan="2" style="padding:14px 16px 6px;color:#FFFFFF;font-size:13px;font-weight:700;text-transform:uppercase;letter-spacing:1px;background:#0D1117;border-bottom:1px solid #1E293B">Receipt Details</td></tr>
               ${rowsHtml}
             </table>
           </td>
@@ -229,9 +246,8 @@ class EmailService {
 
         <!-- Footer -->
         <tr>
-          <td style="padding:20px 24px;text-align:center;background:#080B12;border-top:1px solid #1E293B">
-            <p style="color:#94A3B8;font-size:12px;margin:0 0 4px">This is an automated receipt from <strong style="color:#22C55E">FlameX</strong>.</p>
-            <p style="color:#1E293B;font-size:11px;margin:0">Do not reply to this email.</p>
+          <td class="footer-cell" style="padding:20px 24px;text-align:center;background:#080B12;border-top:1px solid #1E293B">
+            <p style="color:#94A3B8;font-size:12px;margin:0 0 4px">Automated receipt from <strong style="color:#22C55E">FlameX</strong>. Do not reply.</p>
           </td>
         </tr>
 
@@ -241,7 +257,7 @@ class EmailService {
 </body>
 </html>`;
 
-    const text = [`FlameX Receipt — ${typeLabel}`, '', ...rows.map(([l, v]) => `${l}: ${v}`)].join('\n');
+    const text = [`FlameX Receipt \u2014 ${typeLabel}`, '', ...rows.map(([l, v]) => `${l}: ${v}`)].join('\n');
     return this.sendMail({ to, subject, text, html });
   }
 }
