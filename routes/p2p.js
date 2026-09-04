@@ -1,7 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const { body, param, query, validationResult } = require('express-validator');
-const { authMiddleware } = require('../middleware/auth');
+const { authMiddleware, requireTransactionPinSet } = require('../middleware/auth');
 const User = require('../models/User');
 const Transaction = require('../models/Transaction');
 const P2POffer = require('../models/P2POffer');
@@ -544,11 +544,13 @@ router.patch(
 router.post(
   '/offers/:offerId/order',
   authMiddleware,
+  requireTransactionPinSet,
   requireVerifiedKycForTransactions,
   [
     param('offerId').isMongoId(),
     body('cryptoAmount').isFloat({ min: 0.000001 }),
-    body('paymentMethod').optional().isString()
+    body('paymentMethod').optional().isString(),
+    body('pin').isLength({ min: 4, max: 4 }).isNumeric()
   ],
   asyncHandler(async (req, res) => {
     const logger = new Logger('p2p/take-offer');
@@ -574,6 +576,10 @@ router.post(
     }
 
     const [maker, taker] = await Promise.all([User.findById(offer.creatorId), User.findById(req.userId)]);
+    const takerPinValid = await taker?.comparePin(req.body.pin);
+    if (!takerPinValid) {
+      throw new AppError('Invalid PIN', 400);
+    }
     const seller = offer.side === 'sell' ? maker : taker;
     const buyer = offer.side === 'sell' ? taker : maker;
     const fiatAmount = Number((cryptoAmount * offer.price).toFixed(2));
@@ -635,6 +641,18 @@ router.post(
         }
         sessionOffer.updatedAt = new Date();
 
+        const sellerBankAccount = getDefaultBankAccount(seller);
+        const offerPaymentDetails = sessionOffer.paymentDetails || {};
+        const paymentSnapshot = sessionOffer.side === 'sell'
+          ? {
+              bankName: offerPaymentDetails.bankName || sellerBankAccount?.bankName || null,
+              bankCode: offerPaymentDetails.bankCode || sellerBankAccount?.bankCode || null,
+              accountNumber: offerPaymentDetails.accountNumber || sellerBankAccount?.accountNumber || null,
+              accountName: offerPaymentDetails.accountName || sellerBankAccount?.accountName || null,
+              instructions: offerPaymentDetails.instructions || sessionOffer.terms || null
+            }
+          : sellerBankAccount;
+
         const order = new P2POrder({
           offerId: sessionOffer._id,
           offerOwnerId: maker._id,
@@ -649,16 +667,7 @@ router.post(
           escrowUserId: seller._id,
           paymentMethod: selectedPaymentMethod,
           paymentMethods: sessionOffer.paymentMethods || [sessionOffer.paymentMethod || 'bank_transfer'],
-          paymentSnapshot:
-            sessionOffer.side === 'sell'
-            ? {
-                bankName: sessionOffer.paymentDetails?.bankName || null,
-                bankCode: sessionOffer.paymentDetails?.bankCode || null,
-                accountNumber: sessionOffer.paymentDetails?.accountNumber || null,
-                accountName: sessionOffer.paymentDetails?.accountName || null,
-                instructions: sessionOffer.paymentDetails?.instructions || sessionOffer.terms || null
-              }
-            : getDefaultBankAccount(seller),
+          paymentSnapshot,
           escrowLockedAt: new Date(),
           paymentDeadlineAt: new Date(Date.now() + sessionOffer.paymentWindowMinutes * 60 * 1000),
           expiresAt: new Date(Date.now() + sessionOffer.paymentWindowMinutes * 60 * 1000),
@@ -795,6 +804,7 @@ router.post(
 router.post(
   '/orders/:orderId/confirm-payment',
   authMiddleware,
+  requireTransactionPinSet,
   [param('orderId').isMongoId(), body('releaseNote').optional().isString()],
   asyncHandler(async (req, res) => {
     const logger = new Logger('p2p/confirm-payment');
@@ -808,6 +818,14 @@ router.post(
 
     if (String(order.seller.userId) !== String(req.userId)) {
       throw new AppError('Only the seller can release escrow', 403);
+    }
+
+    if (!req.body.pin || !/^\d{4}$/.test(req.body.pin)) {
+      throw new AppError('PIN must be exactly 4 digits', 400);
+    }
+    const sellerForPin = await User.findById(req.userId);
+    if (!(await sellerForPin.comparePin(req.body.pin))) {
+      throw new AppError('Invalid PIN', 400);
     }
 
     if (order.releaseDeadlineAt && new Date() > new Date(order.releaseDeadlineAt)) {
@@ -905,7 +923,8 @@ router.post(
             amount: sessionOrder.cryptoAmount,
             feeAmount: sessionOrder.cryptoFeeAmount
           },
-          sendEmail: true
+          sendEmail: true,
+          transaction: sellerTx
         }),
         createNotification({
           user: buyer,
@@ -917,7 +936,8 @@ router.post(
             reference: sessionOrder.reference,
             amount: sessionOrder.cryptoAmount
           },
-          sendEmail: true
+          sendEmail: true,
+          transaction: buyerTx
         })
       ]);
 

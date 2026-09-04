@@ -1,13 +1,14 @@
 const express = require('express');
 const router = express.Router();
 const { body, validationResult } = require('express-validator');
-const { authMiddleware } = require('../middleware/auth');
+const { authMiddleware, requireTransactionPinSet } = require('../middleware/auth');
 const User = require('../models/User');
 const Transaction = require('../models/Transaction');
 const axios = require('axios');
 const lifiService = require('../services/lifi');
 const { withTransaction } = require('../utils/database');
 const { AppError } = require('../utils/errorHandler');
+const emailService = require('../services/email');
 
 const JUPITER_API = 'https://quote-api.jup.ag/v6';
 const EVM_NATIVE_TOKEN = '0x0000000000000000000000000000000000000000';
@@ -172,13 +173,14 @@ router.get('/quote', authMiddleware, async (req, res) => {
 });
 
 // Execute swap
-router.post('/execute', authMiddleware, [
+router.post('/execute', authMiddleware, requireTransactionPinSet, [
   body('fromChain').notEmpty(),
   body('toChain').notEmpty(),
   body('fromToken').notEmpty(),
   body('toToken').notEmpty(),
   body('fromAmount').optional().isNumeric(),
-  body('amount').optional().isNumeric()
+  body('amount').optional().isNumeric(),
+  body('pin').isLength({ min: 4, max: 4 }).isNumeric()
 ], async (req, res) => {
   try {
     const errors = validationResult(req);
@@ -194,8 +196,12 @@ router.post('/execute', authMiddleware, [
       fromAmount,
       toAmount,
       amount
+      , pin
     } = req.body;
     const user = await User.findById(req.userId);
+    if (!(await user.comparePin(pin))) {
+      return res.status(400).json({ message: 'Invalid PIN' });
+    }
     const debitAmount = Number(fromAmount || amount);
     const creditAmount = Number(toAmount);
     const fromSymbol = String(fromToken).toUpperCase();
@@ -272,6 +278,14 @@ router.post('/execute', authMiddleware, [
         reference
       }
     });
+
+    // Send receipt email asynchronously
+    const swapUser = await User.findById(req.userId).select('email settings');
+    if (swapUser?.email && swapUser.settings?.notifications?.email !== false) {
+      emailService.sendReceiptEmail({ to: swapUser.email, transaction }).catch(err =>
+        console.error('Swap receipt email error:', err.message)
+      );
+    }
   } catch (error) {
     res.status(error.statusCode || 500).json({ message: error.message || 'Server error' });
   }

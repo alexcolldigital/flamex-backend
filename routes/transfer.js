@@ -88,7 +88,7 @@ router.post('/username', authMiddleware, requireTransactionPinSet, requireVerifi
   body('toUsername').trim().isLength({ min: 3 }).withMessage('Invalid username'),
   body('amount').isFloat({ min: 0.000001 }).withMessage('Invalid amount'),
   body('currency').notEmpty().withMessage('Currency required'),
-  body('pin').isLength({ min: 4, max: 6 }).withMessage('Invalid PIN'),
+  body('pin').isLength({ min: 4, max: 4 }).isNumeric().withMessage('PIN must be exactly 4 digits'),
   body('otp').optional().isString(),
   body('chainId').optional().isString(),
   body('description').optional().isString()
@@ -257,7 +257,8 @@ router.post('/username', authMiddleware, requireTransactionPinSet, requireVerifi
           transactionId: senderTx._id,
           username: sessionRecipient.username
         },
-        sendEmail: true
+        sendEmail: true,
+        transaction: senderTx
       }),
       createNotification({
         user: sessionRecipient,
@@ -271,7 +272,8 @@ router.post('/username', authMiddleware, requireTransactionPinSet, requireVerifi
           transactionId: recipientTx._id,
           username: sessionSender.username || sessionSender.email
         },
-        sendEmail: true
+        sendEmail: true,
+        transaction: recipientTx
       })
     ]);
 

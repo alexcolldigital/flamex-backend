@@ -148,9 +148,7 @@ async function createBillNotification({ user, transaction, amount, detail }) {
       type: transaction.type
     },
     sendEmail: true,
-    emailAmount: amount,
-    emailCurrency: 'NGN',
-    emailReference: transaction.reference
+    transaction
   });
 }
 
@@ -387,7 +385,7 @@ router.post('/airtime', authMiddleware, requireTransactionPinSet, requireVerifie
   body('provider').notEmpty(),
   body('phoneNumber').notEmpty(),
   body('amount').isFloat({ min: 50, max: 50000 }),
-  body('pin').isLength({ min: 4, max: 6 })
+  body('pin').isLength({ min: 4, max: 4 }).isNumeric()
 ], async (req, res) => {
   try {
     const errors = validationResult(req);
@@ -472,7 +470,7 @@ router.post('/data', authMiddleware, requireTransactionPinSet, requireVerifiedKy
   body('provider').notEmpty(),
   body('phoneNumber').notEmpty(),
   body('planId').notEmpty(),
-  body('pin').isLength({ min: 4, max: 6 })
+  body('pin').isLength({ min: 4, max: 4 }).isNumeric()
 ], async (req, res) => {
   try {
     const errors = validationResult(req);
@@ -567,7 +565,7 @@ router.post('/electricity', authMiddleware, requireTransactionPinSet, requireVer
   body('meterNumber').notEmpty(),
   body('meterType').isIn(['prepaid', 'postpaid']),
   body('amount').isFloat({ min: 500, max: 500000 }),
-  body('pin').isLength({ min: 4, max: 6 })
+  body('pin').isLength({ min: 4, max: 4 }).isNumeric()
 ], async (req, res) => {
   try {
     const errors = validationResult(req);
@@ -658,7 +656,7 @@ router.post('/cable', authMiddleware, requireTransactionPinSet, requireVerifiedK
   body('provider').notEmpty(),
   body('smartCardNumber').notEmpty(),
   body('packageId').notEmpty(),
-  body('pin').isLength({ min: 4, max: 6 })
+  body('pin').isLength({ min: 4, max: 4 }).isNumeric()
 ], async (req, res) => {
   try {
     const errors = validationResult(req);
@@ -767,7 +765,7 @@ router.post('/giftcard-trade', authMiddleware, requireTransactionPinSet, require
   body('cardCode').optional({ nullable: true }).isString(),
   body('tradeCodePin').optional({ nullable: true }).isString(),
   body('note').optional({ nullable: true }).isString(),
-  body('pin').isLength({ min: 4, max: 6 })
+  body('pin').isLength({ min: 4, max: 4 }).isNumeric()
 ], async (req, res) => {
   try {
     const errors = validationResult(req);

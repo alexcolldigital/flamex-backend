@@ -159,24 +159,40 @@ async function creditNgnDeposit({
       currency,
       transactionId: transaction._id
     },
-    sendEmail: true
+    sendEmail: true,
+    transaction
   });
 
   return user;
 }
+
+const reconcileCooldowns = new Map();
+const RECONCILE_COOLDOWN_MS = 60_000;
 
 async function reconcilePendingDepositsForUser(userId, { limit = 5 } = {}) {
   if (!flutterwaveService.isConfigured) {
     return { checked: 0, credited: 0 };
   }
 
+  const userKey = String(userId);
+  const lastRun = reconcileCooldowns.get(userKey) || 0;
+  if (Date.now() - lastRun < RECONCILE_COOLDOWN_MS) {
+    return { checked: 0, credited: 0 };
+  }
+  reconcileCooldowns.set(userKey, Date.now());
+
+  const now = new Date();
   const pendingTransactions = await Transaction.find({
     userId,
     type: 'deposit',
     currency: { $in: ['NGN', 'USD'] },
     status: 'pending',
     'metadata.provider': 'flutterwave',
-    createdAt: { $gte: new Date(Date.now() - 48 * 60 * 60 * 1000) }
+    createdAt: { $gte: new Date(Date.now() - 48 * 60 * 60 * 1000) },
+    $or: [
+      { 'metadata.flutterwaveId': { $exists: true, $ne: null } },
+      { 'metadata.expiresAt': { $gt: now.toISOString() } }
+    ]
   })
     .sort({ createdAt: -1 })
     .limit(limit);

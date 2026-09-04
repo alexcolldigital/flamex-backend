@@ -58,7 +58,7 @@ router.post('/stake', authMiddleware, [
   body('token').isIn(['SOL', 'FLAME']),
   body('amount').isFloat({ min: 0.000001 }),
   body('lockPeriod').isIn(['flexible', '30days', '90days', '180days', '365days']),
-  body('pin').isLength({ min: 4, max: 6 })
+  body('pin').isLength({ min: 4, max: 4 }).isNumeric()
 ], async (req, res) => {
   try {
     const errors = validationResult(req);

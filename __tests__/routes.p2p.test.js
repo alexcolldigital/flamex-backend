@@ -24,7 +24,8 @@ jest.mock('../middleware/auth', () => ({
   authMiddleware: (req, _res, next) => {
     req.userId = req.headers['x-user-id'];
     next();
-  }
+  },
+  requireTransactionPinSet: (_req, _res, next) => next()
 }));
 
 jest.mock('../middleware/kyc', () => ({
@@ -162,6 +163,8 @@ function createUser({
       disputedTrades: 0,
       totalVolumeNgn: 0
     },
+    pin: 'hashed-test-pin',
+    comparePin: jest.fn().mockResolvedValue(true),
     save: jest.fn().mockImplementation(async function save() {
       mockUsers[String(this._id)] = this;
       return this;
@@ -224,11 +227,7 @@ describe('P2P routes critical escrow flow', () => {
       paymentWindowMinutes: 15,
       paymentMethod: 'bank_transfer',
       paymentMethods: ['bank_transfer'],
-      paymentDetails: {
-        bankName: 'Test Bank',
-        accountNumber: '1234567890',
-        accountName: 'Seller User'
-      },
+      paymentDetails: {},
       status: 'open',
       save: jest.fn().mockResolvedValue(true)
     };
@@ -236,7 +235,7 @@ describe('P2P routes critical escrow flow', () => {
     const response = await request(app)
       .post(`/api/p2p/offers/${offerId}/order`)
       .set('x-user-id', buyer._id)
-      .send({ cryptoAmount: 20, paymentMethod: 'bank_transfer' });
+      .send({ cryptoAmount: 20, paymentMethod: 'bank_transfer', pin: '1234' });
 
     expect(response.status).toBe(201);
     expect(response.body.order.status).toBe('awaiting_payment');
@@ -244,6 +243,11 @@ describe('P2P routes critical escrow flow', () => {
     expect(seller.balances.USDT).toBe(80);
     expect(seller.lockedBalances.USDT).toBe(20);
     expect(mockOffers[offerId].availableAmount).toBe(80);
+    expect(response.body.order.paymentSnapshot).toMatchObject({
+      bankName: 'Test Bank',
+      accountNumber: '1234567890',
+      accountName: 'Seller User'
+    });
   });
 
   test('buyer marking a trade as paid moves the order into awaiting_release', async () => {
@@ -321,7 +325,7 @@ describe('P2P routes critical escrow flow', () => {
     const response = await request(app)
       .post(`/api/p2p/orders/${orderIdTwo}/confirm-payment`)
       .set('x-user-id', seller._id)
-      .send({ releaseNote: 'Payment received, releasing escrow' });
+      .send({ releaseNote: 'Payment received, releasing escrow', pin: '1234' });
 
     expect(response.status).toBe(200);
     expect(mockOrders[orderIdTwo].status).toBe('completed');

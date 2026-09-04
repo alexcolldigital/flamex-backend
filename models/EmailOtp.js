@@ -5,7 +5,7 @@ const emailOtpSchema = new mongoose.Schema({
   userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
   purpose: {
     type: String,
-    enum: ['verify_email', 'pin_reset'],
+    enum: ['verify_email', 'pin_reset', 'password_reset'],
     required: true,
     index: true
   },

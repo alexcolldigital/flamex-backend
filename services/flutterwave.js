@@ -635,7 +635,7 @@ class FlutterwaveService {
           narration: narration || 'FlameX Transfer',
           reference: reference || `FLAMEX_${Date.now()}`,
           currency: currency || 'NGN',
-          callback_url: process.env.APP_URL + '/webhooks/flutterwave'
+          callback_url: `${(process.env.API_URL || process.env.APP_URL || '').replace(/\/$/, '')}/api/deposit/webhooks/flutterwave`
         },
         { headers: this.getHeaders() }
       );

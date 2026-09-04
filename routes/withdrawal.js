@@ -57,7 +57,21 @@ async function refundFailedWithdrawal({ userId, transactionId, amount, failureRe
 }
 
 router.get('/banks', authMiddleware, async (req, res) => {
-  res.json({ banks: BANKS });
+  if (!flutterwaveService.isConfigured) {
+    return res.json({ banks: BANKS });
+  }
+
+  const result = await flutterwaveService.getBanks();
+  if (!result.success) {
+    return res.status(503).json({ message: result.error || 'Unable to load banks' });
+  }
+
+  const banks = (result.banks || []).map((bank) => ({
+    id: bank.id || bank.code,
+    name: bank.name,
+    code: bank.code || bank.id
+  }));
+  res.json({ banks });
 });
 
 router.post('/verify-account', authMiddleware, [
@@ -130,7 +144,7 @@ router.post(['/ngn', '/usd'], authMiddleware, requireTransactionPinSet, requireV
   body('bankCode').notEmpty().withMessage('Bank code required'),
   body('accountNumber').isLength({ min: 10, max: 10 }).withMessage('Invalid account number'),
   body('accountName').notEmpty().withMessage('Account name required'),
-  body('pin').isLength({ min: 4, max: 6 }).withMessage('Invalid PIN'),
+  body('pin').isLength({ min: 4, max: 4 }).isNumeric().withMessage('PIN must be exactly 4 digits'),
   body('otp').optional().isString()
 ], asyncHandler(async (req, res) => {
   const logger = new Logger('withdrawal/ngn');
@@ -188,7 +202,7 @@ router.post(['/ngn', '/usd'], authMiddleware, requireTransactionPinSet, requireV
       throw new AppError('User not found', 404);
     }
 
-    if (getAvailableBalance(sessionUser, 'NGN') < amount) {
+    if (getAvailableBalance(sessionUser, currency) < amount) {
       throw new AppError('Insufficient available balance', 400);
     }
 
@@ -284,7 +298,8 @@ router.post(['/ngn', '/usd'], authMiddleware, requireTransactionPinSet, requireV
       transactionId: transaction._id,
       status: 'pending'
     },
-    sendEmail: true
+    sendEmail: true,
+    transaction
   });
 
   logger.info(`NGN withdrawal initiated: ${reference}, amount: ${amount}`);
@@ -332,7 +347,7 @@ router.post('/crypto', authMiddleware, requireTransactionPinSet, requireVerified
   body('token').notEmpty().withMessage('Token required'),
   body('amount').isFloat({ min: 0.000001 }).withMessage('Invalid amount'),
   body('toAddress').matches(/^0x[a-fA-F0-9]{40}$|^[1-9A-HJ-NP-Z]{32,44}$/).withMessage('Invalid recipient address'),
-  body('pin').isLength({ min: 4, max: 6 }).withMessage('Invalid PIN'),
+  body('pin').isLength({ min: 4, max: 4 }).isNumeric().withMessage('PIN must be exactly 4 digits'),
   body('gasFeeEstimate').optional().isFloat({ min: 0 }).withMessage('Invalid gas fee'),
   body('otp').optional().isString()
 ], asyncHandler(async (req, res) => {
@@ -438,7 +453,8 @@ router.post('/crypto', authMiddleware, requireTransactionPinSet, requireVerified
       transactionId: transaction._id,
       status: 'pending'
     },
-    sendEmail: true
+    sendEmail: true,
+    transaction
   });
 
   logger.info(`Crypto withdrawal initiated: ${reference}, amount: ${amount}, gas: ${gasFeeEstimate}`);

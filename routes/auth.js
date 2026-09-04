@@ -48,6 +48,23 @@ function hashOtp(code) {
   return crypto.createHash('sha256').update(String(code)).digest('hex');
 }
 
+async function issueEmailOtp(user, purpose) {
+  const code = generateOtpCode();
+  const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
+
+  await EmailOtp.deleteMany({ email: user.email, purpose, consumedAt: null });
+  await EmailOtp.create({
+    email: user.email,
+    userId: user._id,
+    purpose,
+    codeHash: hashOtp(code),
+    expiresAt
+  });
+
+  const delivery = await emailService.sendOtpEmail({ to: user.email, code, purpose });
+  return { expiresAt, delivered: delivery.success };
+}
+
 function sanitizeUser(user, referral = null) {
   const settings = user.settings?.toObject ? user.settings.toObject() : user.settings;
   return {
@@ -72,6 +89,7 @@ function sanitizeUser(user, referral = null) {
     virtualCard: user.virtualCard,
     bankAccounts: user.bankAccounts,
     biometricEnabled: user.biometricEnabled,
+    hasTransactionPin: Boolean(user.pin),
     settings,
     referralCode: referral?.code || null
   };
@@ -112,6 +130,21 @@ router.post('/register', [
       wallets = generateFallbackWallets();
     }
 
+    const invalidWallet = wallets.some((wallet) => (
+      !wallet ||
+      typeof wallet.chainId !== 'string' ||
+      !wallet.chainId.trim() ||
+      typeof wallet.address !== 'string' ||
+      !wallet.address.trim() ||
+      typeof wallet.publicKey !== 'string' ||
+      !wallet.publicKey.trim() ||
+      typeof wallet.privateKey !== 'string' ||
+      !wallet.privateKey.trim()
+    ));
+    if (invalidWallet) {
+      return res.status(400).json({ message: 'Each wallet must include a chain, address, public key, and private key' });
+    }
+
     const settings = await getPlatformSettings();
     if (!settings.allowNewRegistrations) {
       return res.status(403).json({ message: 'New registrations are currently disabled' });
@@ -147,6 +180,14 @@ router.post('/register', [
     });
 
     await user.save();
+
+    if (!user.emailVerified) {
+      try {
+        await issueEmailOtp(user, 'verify_email');
+      } catch (error) {
+        console.warn('Initial email verification delivery failed:', error.message);
+      }
+    }
 
     let referredBy = null;
     if (referralCode) {
@@ -258,7 +299,7 @@ router.post('/login', [
 
 // Setup PIN
 router.post('/setup-pin', authMiddleware, [
-  body('pin').isLength({ min: 4, max: 6 }).isNumeric()
+  body('pin').isLength({ min: 4, max: 4 }).isNumeric()
 ], async (req, res) => {
   try {
     const errors = validationResult(req);
@@ -292,8 +333,8 @@ router.post('/setup-pin', authMiddleware, [
 
 // Change PIN
 router.post('/change-pin', authMiddleware, [
-  body('currentPin').isLength({ min: 4, max: 6 }).isNumeric(),
-  body('newPin').isLength({ min: 4, max: 6 }).isNumeric()
+  body('currentPin').isLength({ min: 4, max: 4 }).isNumeric(),
+  body('newPin').isLength({ min: 4, max: 4 }).isNumeric()
 ], async (req, res) => {
   try {
     const errors = validationResult(req);
@@ -328,7 +369,7 @@ router.post('/change-pin', authMiddleware, [
 
 // Verify PIN
 router.post('/verify-pin', authMiddleware, [
-  body('pin').isLength({ min: 4, max: 6 }).isNumeric()
+  body('pin').isLength({ min: 4, max: 4 }).isNumeric()
 ], async (req, res) => {
   try {
     const errors = validationResult(req);
@@ -352,7 +393,7 @@ router.post('/verify-pin', authMiddleware, [
 
 router.post('/request-email-otp', [
   body('email').isEmail().normalizeEmail(),
-  body('purpose').isIn(['verify_email', 'pin_reset'])
+  body('purpose').isIn(['verify_email', 'pin_reset', 'password_reset'])
 ], async (req, res) => {
   try {
     const errors = validationResult(req);
@@ -366,21 +407,9 @@ router.post('/request-email-otp', [
       return res.status(404).json({ message: 'User not found' });
     }
 
-    const code = generateOtpCode();
-    const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
+    const { expiresAt, delivered } = await issueEmailOtp(user, purpose);
 
-    await EmailOtp.deleteMany({ email, purpose, consumedAt: null });
-    await EmailOtp.create({
-      email,
-      userId: user._id,
-      purpose,
-      codeHash: hashOtp(code),
-      expiresAt
-    });
-
-    await emailService.sendOtpEmail({ to: email, code, purpose });
-
-    res.json({ message: 'OTP sent successfully', expiresAt });
+    res.json({ message: 'OTP sent successfully', expiresAt, delivered });
   } catch (error) {
     res.status(500).json({ message: 'Server error' });
   }
@@ -389,7 +418,7 @@ router.post('/request-email-otp', [
 router.post('/verify-email-otp', [
   body('email').isEmail().normalizeEmail(),
   body('code').isLength({ min: 6, max: 6 }).isNumeric(),
-  body('purpose').optional().isIn(['verify_email', 'pin_reset'])
+  body('purpose').optional().isIn(['verify_email', 'pin_reset', 'password_reset'])
 ], async (req, res) => {
   try {
     const errors = validationResult(req);
@@ -454,19 +483,7 @@ router.post('/request-pin-reset-otp', [
       return res.status(404).json({ message: 'User not found' });
     }
 
-    const code = generateOtpCode();
-    const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
-
-    await EmailOtp.deleteMany({ email, purpose: 'pin_reset', consumedAt: null });
-    await EmailOtp.create({
-      email,
-      userId: user._id,
-      purpose: 'pin_reset',
-      codeHash: hashOtp(code),
-      expiresAt
-    });
-
-    await emailService.sendOtpEmail({ to: email, code, purpose: 'pin_reset' });
+    const { expiresAt } = await issueEmailOtp(user, 'pin_reset');
 
     res.json({ message: 'PIN reset OTP sent successfully', expiresAt });
   } catch (error) {
@@ -477,7 +494,7 @@ router.post('/request-pin-reset-otp', [
 router.post('/reset-pin-with-otp', [
   body('email').isEmail().normalizeEmail(),
   body('code').isLength({ min: 6, max: 6 }).isNumeric(),
-  body('newPin').isLength({ min: 4, max: 6 }).isNumeric()
+  body('newPin').isLength({ min: 4, max: 4 }).isNumeric()
 ], async (req, res) => {
   try {
     const errors = validationResult(req);
@@ -497,13 +514,16 @@ router.post('/reset-pin-with-otp', [
       return res.status(400).json({ message: 'OTP is invalid or expired' });
     }
 
-    otp.consumedAt = new Date();
-    await otp.save();
-
     const user = await User.findOne({ email });
     if (!user) {
       return res.status(404).json({ message: 'User not found' });
     }
+    if (!user.emailVerified) {
+      return res.status(403).json({ message: 'Verify your email before resetting your PIN' });
+    }
+
+    otp.consumedAt = new Date();
+    await otp.save();
 
     user.pin = newPin;
     await user.save();
@@ -517,6 +537,73 @@ router.post('/reset-pin-with-otp', [
     });
 
     res.json({ message: 'PIN reset successfully' });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+router.post('/request-password-reset-otp', [
+  body('email').isEmail().normalizeEmail()
+], async (req, res) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ errors: errors.array() });
+    }
+
+    const { email } = req.body;
+    const user = await User.findOne({ email });
+    if (!user) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+
+    const { expiresAt } = await issueEmailOtp(user, 'password_reset');
+    res.json({ message: 'Password reset OTP sent successfully', expiresAt });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+router.post('/reset-password-with-otp', [
+  body('email').isEmail().normalizeEmail(),
+  body('code').isLength({ min: 6, max: 6 }).isNumeric(),
+  body('newPassword').isLength({ min: 8 })
+], async (req, res) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ errors: errors.array() });
+    }
+
+    const { email, code, newPassword } = req.body;
+    const otp = await EmailOtp.findOne({
+      email,
+      purpose: 'password_reset',
+      consumedAt: null,
+      expiresAt: { $gt: new Date() }
+    }).sort({ expiresAt: -1 });
+
+    if (!otp || otp.attempts >= 5) {
+      return res.status(400).json({ message: 'OTP is invalid or expired' });
+    }
+    otp.attempts += 1;
+    if (otp.codeHash !== hashOtp(code)) {
+      await otp.save();
+      return res.status(400).json({ message: 'OTP is invalid or expired' });
+    }
+
+    const user = await User.findOne({ email });
+    if (!user) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+
+    otp.consumedAt = new Date();
+    user.password = newPassword;
+    user.emailVerified = true;
+    user.emailVerifiedAt = new Date();
+    await Promise.all([otp.save(), user.save()]);
+
+    res.json({ message: 'Password reset successfully', verified: true });
   } catch (error) {
     res.status(500).json({ message: 'Server error' });
   }
@@ -636,6 +723,9 @@ router.post('/set-username', authMiddleware, [
 
     res.json({ message: 'Username set successfully', username: lowercaseUsername });
   } catch (error) {
+    if (error.code === 11000) {
+      return res.status(400).json({ message: 'Username already taken' });
+    }
     res.status(500).json({ message: 'Server error' });
   }
 });
