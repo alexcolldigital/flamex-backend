@@ -109,12 +109,25 @@ class EmailService {
     const subject = `FlameX \u2013 ${title}`;
     const text = [title, body, amount !== undefined && currency ? `Amount: ${amount} ${currency}` : null, reference ? `Reference: ${reference}` : null].filter(Boolean).join('\n');
     const html = `<!DOCTYPE html>
-<html>
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
-<body style="margin:0;padding:0;background:#080B12;font-family:Arial,sans-serif">
-  <table width="100%" cellpadding="0" cellspacing="0" style="background:#080B12;padding:32px 16px">
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="x-apple-disable-message-reformatting">
+  <style>
+    @media only screen and (max-width:600px){
+      .outer{padding:16px 8px!important}
+      .card{border-radius:12px!important}
+      .body-cell{padding:20px 16px!important}
+      .amount-box{padding:12px 14px!important}
+      .amount-val{font-size:18px!important}
+    }
+  </style>
+</head>
+<body style="margin:0;padding:0;background:#080B12;font-family:Arial,sans-serif;-webkit-text-size-adjust:100%">
+  <table class="outer" width="100%" cellpadding="0" cellspacing="0" style="background:#080B12;padding:32px 16px">
     <tr><td align="center">
-      <table width="100%" style="max-width:480px;background:#0D1117;border-radius:16px;overflow:hidden;border:1px solid #1E293B">
+      <table class="card" width="100%" cellpadding="0" cellspacing="0" style="max-width:480px;width:100%;background:#0D1117;border-radius:16px;overflow:hidden;border:1px solid #1E293B">
         <tr>
           <td style="background:#111722;padding:24px;text-align:center;border-bottom:1px solid #1E293B">
             <div style="display:inline-block;background:#22C55E;border-radius:12px;padding:8px 18px">
@@ -123,11 +136,11 @@ class EmailService {
           </td>
         </tr>
         <tr>
-          <td style="padding:28px 24px">
+          <td class="body-cell" style="padding:28px 24px">
             <p style="color:#FFFFFF;font-size:17px;font-weight:700;margin:0 0 12px">${title}</p>
             <p style="color:#94A3B8;font-size:14px;margin:0 0 20px;line-height:1.6">${body}</p>
-            ${amount !== undefined && currency ? `<div style="background:#111722;border:1px solid #1E293B;border-radius:10px;padding:14px 18px;margin-bottom:16px"><span style="color:#94A3B8;font-size:12px;text-transform:uppercase;letter-spacing:1px">Amount</span><br><span style="color:#22C55E;font-size:22px;font-weight:900">${amount} ${currency}</span></div>` : ''}
-            ${reference ? `<p style="color:#94A3B8;font-size:12px;margin:0">Reference: <span style="color:#FFFFFF;font-weight:600">${reference}</span></p>` : ''}
+            ${amount !== undefined && currency ? `<div class="amount-box" style="background:#111722;border:1px solid #1E293B;border-radius:10px;padding:14px 18px;margin-bottom:16px"><span style="color:#94A3B8;font-size:12px;text-transform:uppercase;letter-spacing:1px">Amount</span><br><span class="amount-val" style="color:#22C55E;font-size:22px;font-weight:900">${amount} ${currency}</span></div>` : ''}
+            ${reference ? `<p style="color:#94A3B8;font-size:12px;margin:0">Reference: <span style="color:#FFFFFF;font-weight:600;word-break:break-all">${reference}</span></p>` : ''}
           </td>
         </tr>
         <tr>
