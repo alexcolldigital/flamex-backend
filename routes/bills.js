@@ -62,18 +62,6 @@ const PROVIDERS = {
     { id: 'startimes', name: 'StarTimes', packages: ['Nova', 'Basic', 'Classic', 'Unique'] }
   ],
 
-  // Betting Platforms
-  betting: [
-    { id: 'bet9ja', name: 'Bet9ja', minAmount: 100 },
-    { id: 'betking', name: 'BetKing', minAmount: 100 },
-    { id: 'sportybet', name: 'SportyBet', minAmount: 100 },
-    { id: '1xbet', name: '1xBet', minAmount: 100 },
-    { id: 'betway', name: 'Betway', minAmount: 100 },
-    { id: 'nairabet', name: 'NairaBet', minAmount: 100 },
-    { id: 'merrybet', name: 'MerryBet', minAmount: 100 },
-    { id: 'betpawa', name: 'BetPawa', minAmount: 50 }
-  ],
-
   giftcards: {}
 };
 
@@ -745,66 +733,6 @@ router.post('/cable', authMiddleware, requireTransactionPinSet, requireVerifiedK
         smartCardNumber,
         package: package_.name,
         amount: package_.amount
-      }
-    });
-  } catch (error) {
-    res.status(error.statusCode || 500).json({ message: error.message || 'Server error' });
-  }
-});
-
-// Betting Deposit
-router.post('/betting', authMiddleware, requireTransactionPinSet, requireVerifiedKycForTransactions, [
-  body('provider').notEmpty(),
-  body('accountId').notEmpty(),
-  body('amount').isFloat({ min: 100, max: 1000000 }),
-  body('pin').isLength({ min: 4, max: 6 })
-], async (req, res) => {
-  try {
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) {
-      return res.status(400).json({ errors: errors.array() });
-    }
-
-    const { provider, accountId, amount, pin } = req.body;
-    const user = await User.findById(req.userId);
-
-    const pinMatch = await user.comparePin(pin);
-    if (!pinMatch) {
-      return res.status(400).json({ message: 'Invalid PIN' });
-    }
-
-    if (user.balances.NGN < amount) {
-      return res.status(400).json({ message: 'Insufficient NGN balance' });
-    }
-
-    const reference = `BET-${Date.now()}`;
-    const providerName = PROVIDERS.betting.find(p => p.id === provider)?.name || provider;
-
-    const { user: updatedUser, transaction } = await completeBillPayment({
-      userId: req.userId,
-      amount,
-      reference,
-      type: 'betting',
-      description: `${providerName} deposit`,
-      metadata: { provider, accountId, billType: 'betting' }
-    });
-
-    await createBillNotification({
-      user: updatedUser,
-      transaction,
-      amount,
-      detail: `${providerName} betting deposit`
-    });
-
-    res.json({
-      success: true,
-      message: 'Betting deposit successful',
-      reference,
-      newBalance: updatedUser.balances.NGN,
-      details: {
-        provider: providerName,
-        accountId,
-        amount
       }
     });
   } catch (error) {
