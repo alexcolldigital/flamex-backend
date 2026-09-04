@@ -57,6 +57,7 @@ const account = {
   lastName: 'Wallet',
   email: 'wallet@example.com',
   phone: '+2348012345678',
+  username: 'walletuser',
   password: 'password123'
 };
 

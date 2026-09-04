@@ -103,7 +103,8 @@ router.post('/register', [
   body('phone').isMobilePhone(),
   body('password').isLength({ min: 8 }),
   body('mnemonic').optional().isString(),
-  body('wallets').optional().isArray({ min: 1 })
+  body('wallets').optional().isArray({ min: 1 }),
+  body('username').trim().isLength({ min: 3, max: 30 }).matches(/^[a-zA-Z0-9_]+$/)
 ], async (req, res) => {
   try {
     const errors = validationResult(req);
@@ -119,7 +120,8 @@ router.post('/register', [
       password,
       mnemonic,
       wallets,
-      referralCode
+      referralCode,
+      username
     } = req.body;
 
     if (!mnemonic || typeof mnemonic !== 'string') {
@@ -167,6 +169,9 @@ router.post('/register', [
 
     const primaryWallet = wallets.find((wallet) => wallet.chainId === 'solana') || wallets[0];
 
+    const taken = await User.findOne({ username: username.toLowerCase() });
+    if (taken) return res.status(400).json({ message: 'Username already taken' });
+
     const user = new User({
       firstName,
       lastName,
@@ -176,7 +181,9 @@ router.post('/register', [
       encryptedMnemonic,
       wallets: encryptedWallets,
       primaryWalletAddress: primaryWallet.address,
-      status: 'active'
+      status: 'active',
+      username: username.toLowerCase(),
+      usernameSet: true
     });
 
     await user.save();
@@ -699,7 +706,7 @@ router.post('/kyc', authMiddleware, [
   }
 });
 
-// Set Username
+// Usernames are chosen during registration and cannot be added or changed later.
 router.post('/set-username', authMiddleware, [
   body('username').trim().isLength({ min: 3, max: 30 }).matches(/^[a-zA-Z0-9_]+$/)
 ], async (req, res) => {
@@ -709,19 +716,7 @@ router.post('/set-username', authMiddleware, [
       return res.status(400).json({ errors: errors.array() });
     }
 
-    const { username } = req.body;
-    const lowercaseUsername = username.toLowerCase();
-
-    const existingUser = await User.findOne({ username: lowercaseUsername });
-    if (existingUser && existingUser._id.toString() !== String(req.userId)) {
-      return res.status(400).json({ message: 'Username already taken' });
-    }
-
-    const user = await User.findById(req.userId);
-    user.username = lowercaseUsername;
-    await user.save();
-
-    res.json({ message: 'Username set successfully', username: lowercaseUsername });
+    res.status(400).json({ message: 'Username can only be set during registration' });
   } catch (error) {
     if (error.code === 11000) {
       return res.status(400).json({ message: 'Username already taken' });

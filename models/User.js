@@ -18,6 +18,7 @@ const userSchema = new mongoose.Schema({
     maxlength: 30,
     match: /^[a-zA-Z0-9_]+$/
   },
+  usernameSet: { type: Boolean, default: false },
   
   profilePicture: { type: String, default: null },
   emailVerified: { type: Boolean, default: false },
@@ -171,6 +172,13 @@ const userSchema = new mongoose.Schema({
   },
   createdAt: { type: Date, default: Date.now },
   updatedAt: { type: Date, default: Date.now }
+});
+
+userSchema.pre('save', function preventUsernameChanges(next) {
+  if (!this.isNew && this.isModified('username')) {
+    return next(new Error('Username can only be set during registration'));
+  }
+  next();
 });
 
 // Indexes are automatically created by unique: true and sparse: true properties

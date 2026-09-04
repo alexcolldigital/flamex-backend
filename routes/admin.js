@@ -185,13 +185,12 @@ router.put('/users/:id', [
   body('lastName').optional().isString().trim().isLength({ min: 1, max: 80 }),
   body('email').optional().isEmail().normalizeEmail(),
   body('phone').optional().isString().trim().isLength({ min: 7, max: 30 }),
-  body('username').optional({ nullable: true }).isString().trim().isLength({ min: 3, max: 30 }).matches(/^[a-zA-Z0-9_]+$/),
   body('emailVerified').optional().isBoolean().toBoolean()
 ], async (req, res) => {
   try {
     if (!sendValidation(req, res)) return;
 
-    const allowedFields = ['firstName', 'lastName', 'email', 'phone', 'username', 'emailVerified'];
+    const allowedFields = ['firstName', 'lastName', 'email', 'phone', 'emailVerified'];
     const updates = Object.fromEntries(
       allowedFields.filter((field) => req.body[field] !== undefined).map((field) => [field, req.body[field]])
     );
