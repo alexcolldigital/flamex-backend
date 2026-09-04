@@ -3,7 +3,7 @@ const router = express.Router();
 const { authMiddleware } = require('../middleware/auth');
 const User = require('../models/User');
 const Transaction = require('../models/Transaction');
-const { decrypt } = require('../utils/encryption');
+const { createWalletSecret, decrypt } = require('../utils/encryption');
 const { reconcilePendingDepositsForUser } = require('./deposit');
 const flutterwaveService = require('../services/flutterwave');
 const { withTransaction } = require('../utils/database');
@@ -17,13 +17,6 @@ const CHAIN_METADATA = [
   { id: 'base', name: 'Base', symbol: 'ETH', color: '#0052FF', explorerBaseUrl: 'https://basescan.org/address/' },
   { id: 'arbitrum', name: 'Arbitrum', symbol: 'ETH', color: '#28A0F0', explorerBaseUrl: 'https://arbiscan.io/address/' }
 ];
-
-const createUserSecret = (password) => {
-  if (!process.env.ENCRYPTION_KEY) {
-    throw new Error('ENCRYPTION_KEY must be set before exporting wallet keys');
-  }
-  return `${password}:${process.env.ENCRYPTION_KEY}`;
-};
 
 function buildWalletSummary(user) {
   const wallets = (user.wallets || []).map((wallet) => {
@@ -55,17 +48,7 @@ function buildWalletSummary(user) {
     walletAddress: primaryWallet?.address || null,
     primaryWalletAddress: primaryWallet?.address || null,
     primaryWallet,
-    fiatAccounts: {
-      NGN: {
-        bankName: 'Wema Bank',
-        accountNumber: '1234567890',
-        accountName: `${user.firstName} ${user.lastName}`
-      },
-      USD: {
-        provider: 'FlameX USD Balance',
-        accountId: `USD-${String(user._id).slice(-8).toUpperCase()}`
-      }
-    },
+    fiatAccounts: user.fiatAccounts || {},
     virtualCard: user.virtualCard,
     bankAccounts: user.bankAccounts,
     profile: {
@@ -166,7 +149,7 @@ router.post('/export-keys', authMiddleware, async (req, res) => {
     }
 
     const result = { mnemonic: null, wallets: [] };
-    const userSecret = createUserSecret(password);
+    const userSecret = createWalletSecret(password);
 
     if (user.encryptedMnemonic) {
       try {

@@ -8,16 +8,12 @@ const Referral = require('../models/Referral');
 const Transaction = require('../models/Transaction');
 const EmailOtp = require('../models/EmailOtp');
 const { generateToken, authMiddleware } = require('../middleware/auth');
-const { encrypt } = require('../utils/encryption');
+const { createWalletSecret, encrypt } = require('../utils/encryption');
 const emailService = require('../services/email');
 const { createNotification } = require('../services/notifications');
 const { isAdminUser, buildAdminProfile } = require('../utils/admin');
 const { logAuditEvent } = require('../services/audit');
 const { getPlatformSettings } = require('../utils/admin');
-
-const createUserSecret = (password) => {
-  return `${password}:${process.env.JWT_SECRET || 'flamex-secret-key-change-in-production'}`;
-};
 
 function generateReferralCode() {
   const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
@@ -126,7 +122,7 @@ router.post('/register', [
       return res.status(400).json({ message: 'User with this email or phone already exists' });
     }
 
-    const userSecret = createUserSecret(password);
+    const userSecret = createWalletSecret(password);
     const encryptedMnemonic = encrypt(mnemonic, userSecret);
     const encryptedWallets = wallets.map((wallet) => ({
       chainId: wallet.chainId,
@@ -160,7 +156,17 @@ router.post('/register', [
         referrer.totalReferrals += 1;
         referrer.activeReferrals += 1;
         referrer.referredUsers.push({ userId: user._id, status: 'active' });
-        referrer.updateTier();
+        const bonus = await getPlatformSettings().then(s => Number(s.referralCommissionRate || 500));
+        referrer.pendingRewards += bonus;
+        referrer.totalRewards += bonus;
+        referrer.rewardHistory.push({
+          amount: bonus,
+          currency: 'NGN',
+          type: 'signup_bonus',
+          fromUser: user._id,
+          description: `Referral bonus for inviting ${user.firstName} ${user.lastName}`,
+          status: 'pending'
+        });
         await referrer.save();
       }
     }
@@ -658,8 +664,7 @@ router.get('/me', authMiddleware, async (req, res) => {
           totalReferrals: referral.totalReferrals,
           activeReferrals: referral.activeReferrals,
           totalRewards: referral.totalRewards,
-          pendingRewards: referral.pendingRewards,
-          tier: referral.tier
+          pendingRewards: referral.pendingRewards
         } : null
       }
     });

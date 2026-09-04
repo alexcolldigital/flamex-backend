@@ -92,6 +92,25 @@ const userSchema = new mongoose.Schema({
     isDefault: { type: Boolean, default: false }
   }],
 
+  fiatAccounts: {
+    NGN: {
+      bankName: { type: String, default: null },
+      bankCode: { type: String, default: null },
+      accountNumber: { type: String, default: null },
+      accountName: { type: String, default: null },
+      provider: { type: String, default: null },
+      providerAccountId: { type: String, default: null },
+      reference: { type: String, default: null },
+      updatedAt: { type: Date, default: null }
+    },
+    USD: {
+      provider: { type: String, default: null },
+      accountId: { type: String, default: null },
+      accountNumber: { type: String, default: null },
+      updatedAt: { type: Date, default: null }
+    }
+  },
+
   p2pProfile: {
     isMerchant: { type: Boolean, default: false },
     merchantStatus: {

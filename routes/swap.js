@@ -162,18 +162,8 @@ router.get('/quote', authMiddleware, async (req, res) => {
       }
     }
 
-    // Fallback to mock for cross-chain
-    res.json({
-      type: 'cross-chain',
-      fromChain,
-      toChain,
-      fromToken,
-      toToken,
-      fromAmount,
-      toAmount: Math.floor(fromAmount * 0.98),
-      provider: 'lifi',
-      slippage,
-      estimatedTime: 300
+    return res.status(503).json({
+      message: 'Swap provider is unavailable. No quote was created.'
     });
   } catch (error) {
     console.error('Quote error:', error);

@@ -3,6 +3,10 @@ const crypto = require('crypto');
 const ENCRYPTION_SECRET = process.env.ENCRYPTION_KEY;
 const IV_LENGTH = 16;
 
+function createWalletSecret(password) {
+  return `${password}:${process.env.JWT_SECRET || 'flamex-secret-key-change-in-production'}`;
+}
+
 function getEncryptionKey() {
   if (!ENCRYPTION_SECRET) {
     throw new Error('ENCRYPTION_KEY must be set in environment for secure wallet encryption');
@@ -121,6 +125,7 @@ function generateRandomString(length = 32) {
 }
 
 module.exports = {
+  createWalletSecret,
   encrypt,
   decrypt,
   hashPassword,

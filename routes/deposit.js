@@ -134,6 +134,7 @@ async function creditNgnDeposit({
     confirmedAt: new Date().toISOString()
   };
   transaction.markModified('metadata');
+
   await transaction.save({ session });
 
   const user = await User.findByIdAndUpdate(

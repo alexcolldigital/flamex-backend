@@ -23,9 +23,9 @@ function getAvailableBalance(user, currency) {
 router.get('/validate-username/:username', authMiddleware, asyncHandler(async (req, res) => {
   const user = await User.findOne({ 
     username: req.params.username.toLowerCase() 
-  }).select('username firstName lastName profilePicture');
+  }).select('username firstName lastName profilePicture settings.privacy.allowUsernameSearch');
 
-  if (!user) {
+  if (!user || user.settings?.privacy?.allowUsernameSearch === false) {
     return res.json({ valid: false, message: 'User not found' });
   }
 
@@ -125,6 +125,10 @@ router.post('/username', authMiddleware, requireTransactionPinSet, requireVerifi
   // Find recipient
   const recipient = await User.findOne({ username: toUsername.toLowerCase() });
   if (!recipient) {
+    throw new AppError('Recipient not found', 404);
+  }
+
+  if (recipient.settings?.privacy?.allowUsernameSearch === false) {
     throw new AppError('Recipient not found', 404);
   }
 

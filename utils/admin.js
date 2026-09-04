@@ -6,7 +6,7 @@ const DEFAULT_PLATFORM_SETTINGS = {
   requireKycForTransactions: true,
   maxWithdrawalLimit: 50000,
   minWithdrawalAmount: 10,
-  referralCommissionRate: 5,
+  referralCommissionRate: 500,
   fees: {
     swapFee: 0.5,
     bridgeFee: 1,

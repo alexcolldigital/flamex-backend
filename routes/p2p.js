@@ -384,6 +384,7 @@ router.get('/offers/mine', authMiddleware, async (req, res) => {
 router.post(
   '/offers',
   authMiddleware,
+  requireVerifiedKycForTransactions,
   [
     body('side').isIn(['buy', 'sell']),
     body('asset').custom((value) => ensureSupportedAsset(value)),
