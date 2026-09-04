@@ -25,7 +25,7 @@ app.use(helmet({
       styleSrc: ["'self'", "'unsafe-inline'"],
       scriptSrc: ["'self'"],
       imgSrc: ["'self'", 'data:', 'https:'],
-      connectSrc: ["'self'", process.env.FRONTEND_URL, process.env.ADMIN_FRONTEND_URL]
+      connectSrc: ["'self'", process.env.FRONTEND_URL, process.env.ADMIN_FRONTEND_URL].filter(Boolean)
     }
   },
   referrerPolicy: { policy: 'strict-origin-when-cross-origin' },
