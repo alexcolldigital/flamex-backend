@@ -616,10 +616,8 @@ router.post(
       }
 
       return withTransaction(async (session) => {
-        const [sessionOffer, sessionSeller] = await Promise.all([
-          P2POffer.findById(offer._id).session(session),
-          User.findById(seller._id).session(session)
-        ]);
+        const sessionOffer = await P2POffer.findById(offer._id).session(session);
+        const sessionSeller = await User.findById(seller._id).session(session);
 
         if (!sessionOffer || sessionOffer.status !== 'open') {
           throw new AppError('Offer not available', 404);
@@ -682,11 +680,9 @@ router.post(
           `Trade opened for ${cryptoAmount} ${sessionOffer.asset} at ${sessionOffer.price} ${sessionOffer.fiatCurrency}/${sessionOffer.asset}. Seller funds are now locked in escrow.`
         );
 
-        await Promise.all([
-          sessionSeller.save({ session }),
-          sessionOffer.save({ session }),
-          order.save({ session })
-        ]);
+        await sessionSeller.save({ session });
+        await sessionOffer.save({ session });
+        await order.save({ session });
 
         logger.info(`P2P order created: ${order.reference}, seller: ${seller._id}, buyer: ${buyer._id}, amount: ${cryptoAmount} ${offer.asset}`);
 
