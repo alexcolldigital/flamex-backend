@@ -75,6 +75,18 @@ describe('email verification', () => {
     expect(mockOtpRecord.purpose).toBe('verify_email');
   });
 
+  test('reports an SMTP delivery failure instead of claiming the OTP was sent', async () => {
+    const emailService = require('../services/email');
+    emailService.sendOtpEmail.mockResolvedValueOnce({ success: false, error: 'SMTP unavailable' });
+
+    const response = await request(createApp())
+      .post('/auth/request-email-otp')
+      .send({ email: mockUser.email, purpose: 'verify_email' });
+
+    expect(response.status).toBe(503);
+    expect(response.body.message).toMatch(/unable to send verification code/i);
+  });
+
   test('rejects an incorrect OTP without verifying the user', async () => {
     const response = await request(createApp())
       .post('/auth/verify-email-otp')

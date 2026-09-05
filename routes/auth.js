@@ -51,6 +51,10 @@ function hashOtp(code) {
 async function issueEmailOtp(user, purpose) {
   const code = generateOtpCode();
   const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
+  const delivery = await emailService.sendOtpEmail({ to: user.email, code, purpose });
+  if (!delivery.success) {
+    throw new Error(delivery.error || 'Email delivery failed');
+  }
 
   await EmailOtp.deleteMany({ email: user.email, purpose, consumedAt: null });
   await EmailOtp.create({
@@ -61,8 +65,7 @@ async function issueEmailOtp(user, purpose) {
     expiresAt
   });
 
-  const delivery = await emailService.sendOtpEmail({ to: user.email, code, purpose });
-  return { expiresAt, delivered: delivery.success };
+  return { expiresAt, delivered: true };
 }
 
 function sanitizeUser(user, referral = null) {
@@ -418,7 +421,8 @@ router.post('/request-email-otp', [
 
     res.json({ message: 'OTP sent successfully', expiresAt, delivered });
   } catch (error) {
-    res.status(500).json({ message: 'Server error' });
+    console.error('Email OTP delivery error:', error.message);
+    res.status(503).json({ message: 'Unable to send verification code. Please try again shortly.' });
   }
 });
 
