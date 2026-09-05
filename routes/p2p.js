@@ -969,11 +969,9 @@ router.post(
     }
 
     return withTransaction(async (session) => {
-      const [sessionOrder, offer, seller] = await Promise.all([
-        P2POrder.findById(order._id).session(session),
-        P2POffer.findById(order.offerId).session(session),
-        User.findById(order.seller.userId).session(session)
-      ]);
+      const sessionOrder = await P2POrder.findById(order._id).session(session);
+      const offer = await P2POffer.findById(order.offerId).session(session);
+      const seller = await User.findById(order.seller.userId).session(session);
 
       if (!sessionOrder) {
         throw new AppError('Order not found', 404);
@@ -1007,11 +1005,11 @@ router.post(
 
       updateP2PProfileStats(seller, { totalTrades: 1, cancelledTrades: 1 });
 
-      await Promise.all([
-        seller.save({ session }),
-        sessionOrder.save({ session }),
-        ...(offer ? [offer.save({ session })] : [])
-      ]);
+      await seller.save({ session });
+      await sessionOrder.save({ session });
+      if (offer) {
+        await offer.save({ session });
+      }
 
       logger.info(`P2P order cancelled: ${sessionOrder.reference}, reason: ${req.body.reason || 'unspecified'}`);
 
