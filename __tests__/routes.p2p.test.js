@@ -284,6 +284,38 @@ describe('P2P routes critical escrow flow', () => {
     expect(mockOrders[orderIdOne].releaseDeadlineAt).toBeTruthy();
   });
 
+  test('only trade participants can send messages', async () => {
+    mockOrders[orderIdOne] = {
+      _id: orderIdOne,
+      seller: { userId: sellerId, username: 'seller', fullName: 'Seller User' },
+      buyer: { userId: buyerId, username: 'buyer', fullName: 'Buyer User' },
+      status: 'awaiting_payment',
+      messages: [],
+      save: jest.fn().mockResolvedValue(true)
+    };
+
+    const buyerResponse = await request(app)
+      .post(`/api/p2p/orders/${orderIdOne}/message`)
+      .set('x-user-id', buyerId)
+      .send({ message: 'I am sending the payment now.' });
+
+    expect(buyerResponse.status).toBe(200);
+    expect(mockOrders[orderIdOne].messages).toHaveLength(1);
+    expect(mockOrders[orderIdOne].messages[0]).toMatchObject({
+      senderUserId: buyerId,
+      senderLabel: 'Buyer',
+      message: 'I am sending the payment now.'
+    });
+
+    const outsiderResponse = await request(app)
+      .post(`/api/p2p/orders/${orderIdOne}/message`)
+      .set('x-user-id', '507f1f77bcf86cd799439099')
+      .send({ message: 'This should not be visible.' });
+
+    expect(outsiderResponse.status).toBe(404);
+    expect(mockOrders[orderIdOne].messages).toHaveLength(1);
+  });
+
   test('seller confirming payment releases escrow to the buyer and completes the trade', async () => {
     const seller = createUser({
       id: sellerId,

@@ -34,7 +34,7 @@ class EmailService {
     }
 
     try {
-      await this.transporter.sendMail({
+      const result = await this.transporter.sendMail({
         from: this.from,
         to,
         subject,
@@ -42,10 +42,20 @@ class EmailService {
         html
       });
 
-      return { success: true };
+      console.info('Email accepted by SMTP provider', {
+        messageId: result.messageId,
+        accepted: result.accepted,
+        rejected: result.rejected,
+        response: result.response
+      });
+
+      if (!result.accepted?.includes(to) || result.rejected?.includes(to)) {
+        return { success: false, error: 'SMTP provider did not accept the recipient' };
+      }
+
+      return { success: true, messageId: result.messageId };
     } catch (error) {
       console.error('Email send error:', error.message);
-      // Don't throw error - make email failures non-blocking in development
       return { success: false, error: error.message };
     }
   }

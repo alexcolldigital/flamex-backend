@@ -37,8 +37,8 @@ app.use(helmet({
   hsts: { maxAge: 31536000, includeSubDomains: true, preload: true }
 }));
 
-// Trust proxy for Render deployment and rate limiting
-app.set('trust proxy', process.env.NODE_ENV === 'production' ? 1 : false);
+// Render terminates TLS at a proxy even when NODE_ENV is misconfigured.
+app.set('trust proxy', process.env.NODE_ENV === 'production' || process.env.RENDER ? 1 : false);
 
 // CORS configuration
 const allowedOrigins = [
@@ -302,6 +302,15 @@ const server = app.listen(PORT, () => {
     nodeVersion: process.version
   });
 });
+
+const emailService = require('./services/email');
+if (emailService.transporter) {
+  emailService.transporter.verify()
+    .then(() => logger.info('SMTP connection verified'))
+    .catch((error) => logger.error('SMTP connection verification failed', { error: error.message }));
+} else {
+  logger.error('SMTP is not configured; verification emails cannot be delivered');
+}
 
 // Handle server errors
 server.on('error', (err) => {
