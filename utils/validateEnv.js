@@ -47,6 +47,12 @@ const validateEnvironment = () => {
         warnings.push(`⚠️  Optional env variable missing: ${key}`);
       }
     });
+
+    ['SMTP_HOST', 'SMTP_PORT', 'SMTP_USER', 'SMTP_PASS'].forEach(key => {
+      if (!process.env[key]) {
+        missing.push(`${key} is required in production to deliver verification codes`);
+      }
+    });
   }
 
   // Validate specific values

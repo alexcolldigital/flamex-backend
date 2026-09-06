@@ -41,7 +41,7 @@ function generateFallbackWallets() {
 }
 
 function generateOtpCode() {
-  return String(Math.floor(100000 + Math.random() * 900000));
+  return crypto.randomInt(100000, 1000000).toString();
 }
 
 function hashOtp(code) {
@@ -191,11 +191,13 @@ router.post('/register', [
 
     await user.save();
 
+    let emailVerificationSent = user.emailVerified === true;
     if (!user.emailVerified) {
       try {
         await issueEmailOtp(user, 'verify_email');
+        emailVerificationSent = true;
       } catch (error) {
-        console.warn('Initial email verification delivery failed:', error.message);
+        console.error('Initial email verification delivery failed:', error.message);
       }
     }
 
@@ -245,7 +247,8 @@ router.post('/register', [
     res.status(201).json({
       message: 'User registered successfully',
       token,
-      user: sanitizeUser(user, referral)
+      user: sanitizeUser(user, referral),
+      emailVerificationSent
     });
   } catch (error) {
     console.error('Registration error:', error);
