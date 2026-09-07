@@ -84,6 +84,7 @@ describe('wallet creation during registration', () => {
     expect(response.status).toBe(201);
     expect(response.body.token).toBe('test-token');
     expect(response.body.emailVerificationSent).toBe(true);
+    expect(response.body.requiresEmailVerification).toBe(true);
     expect(response.body.user.wallets).toEqual([
       { chainId: 'ethereum', address: '0xabc', publicKey: '0xpub' }
     ]);

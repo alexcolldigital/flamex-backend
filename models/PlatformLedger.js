@@ -4,7 +4,7 @@ const platformLedgerSchema = new mongoose.Schema(
   {
     category: {
       type: String,
-      enum: ['p2p_crypto_fee', 'p2p_ngn_fee', 'treasury_withdrawal'],
+      enum: ['p2p_crypto_fee', 'p2p_ngn_fee', 'service_fee', 'treasury_withdrawal'],
       required: true
     },
     direction: {

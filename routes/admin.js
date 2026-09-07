@@ -17,6 +17,7 @@ const { getTreasuryBalances, getTreasurySummary, createLedgerEntry } = require('
 const { logAuditEvent } = require('../services/audit');
 const { getGiftCardConfig, saveGiftCardConfig } = require('../utils/giftcards');
 const { createNotification } = require('../services/notifications');
+const { getConfiguredFee, recordPlatformFee } = require('../services/monetization');
 
 const router = express.Router();
 
@@ -678,7 +679,7 @@ router.get('/dashboard/overview', async (req, res) => {
     const today = new Date();
     today.setHours(0, 0, 0, 0);
 
-    const [totalUsers, activeUsers, newUsersToday, totalTransactions, pendingKYC, pendingTransactions, balances] =
+    const [totalUsers, activeUsers, newUsersToday, totalTransactions, pendingKYC, pendingTransactions, balances, feeRevenue] =
       await Promise.all([
         User.countDocuments(),
         User.countDocuments({ status: 'active' }),
@@ -686,7 +687,11 @@ router.get('/dashboard/overview', async (req, res) => {
         Transaction.countDocuments(),
         User.countDocuments({ kycVerified: false, kycLevel: { $gt: 0 } }),
         Transaction.countDocuments({ status: 'pending' }),
-        getTreasuryBalances()
+        getTreasuryBalances(),
+        PlatformLedger.aggregate([
+          { $match: { direction: 'credit', category: { $in: ['service_fee', 'p2p_crypto_fee', 'p2p_ngn_fee'] }, status: 'completed' } },
+          { $group: { _id: null, total: { $sum: '$amount' } } }
+        ])
       ]);
 
     const p2pOrders = await P2POrder.find({ status: 'completed' }).sort({ createdAt: -1 }).limit(50);
@@ -702,6 +707,7 @@ router.get('/dashboard/overview', async (req, res) => {
       pendingKYC,
       pendingTransactions,
       totalRevenue,
+      feeRevenue: Number(feeRevenue[0]?.total || 0),
       treasuryBalances: balances
     });
   } catch (error) {
@@ -850,7 +856,20 @@ router.get('/settings/fees', async (req, res) => {
 
 router.put('/settings/fees', async (req, res) => {
   try {
-    const settings = await savePlatformSettings({ fees: req.body || {} }, req.userId);
+    const limits = {
+      swapFee: 10, bridgeFee: 10, transferFee: 10, depositFee: 100,
+      withdrawalFee: 100000, giftCardFee: 100, billPaymentFee: 100,
+      p2pCryptoFeeRate: 10, p2pNgnFeeRate: 10
+    };
+    const suppliedFees = req.body || {};
+    const invalid = Object.entries(suppliedFees).find(([key, value]) => (
+      !Object.prototype.hasOwnProperty.call(limits, key) ||
+      typeof value !== 'number' || !Number.isFinite(value) || value < 0 || value > limits[key]
+    ));
+    if (invalid) {
+      return res.status(400).json({ message: `Invalid fee setting: ${invalid[0]}` });
+    }
+    const settings = await savePlatformSettings({ fees: suppliedFees }, req.userId);
     await logAuditEvent(req, {
       action: 'admin_update_fees',
       entityType: 'platform_fee',
@@ -1113,7 +1132,12 @@ router.post('/giftcard-trades/:id/approve', [param('id').isMongoId(), body('fina
       return res.status(404).json({ message: 'Trade owner not found' });
     }
 
-    const finalPayout = Number(req.body.finalPayout ?? trade.estimatedPayout);
+    const grossPayout = Number(req.body.finalPayout ?? trade.estimatedPayout);
+    const feeConfig = await getConfiguredFee('giftCardFee', grossPayout, { currency: 'NGN' });
+    const finalPayout = Number((grossPayout - feeConfig.fee).toFixed(2));
+    if (finalPayout <= 0) {
+      return res.status(400).json({ message: 'Gift card payout is too small after fees' });
+    }
     user.balances.NGN = Number(user.balances.NGN || 0) + finalPayout;
 
     const transaction = await Transaction.create({
@@ -1124,10 +1148,22 @@ router.post('/giftcard-trades/:id/approve', [param('id').isMongoId(), body('fina
       description: `Gift card trade approved for ${trade.brand} ${trade.currency} ${trade.cardValue}`,
       status: 'completed',
       reference: `${trade.reference}-CR`,
+      fee: feeConfig.fee,
+      feeCurrency: 'NGN',
       metadata: {
         giftCardTradeId: trade._id,
         billType: 'giftcard_trade'
       }
+    });
+
+    await recordPlatformFee({
+      fee: feeConfig.fee,
+      currency: 'NGN',
+      reference: trade.reference,
+      sourceType: 'gift_card_trade',
+      sourceId: trade._id,
+      userId: req.userId,
+      metadata: { grossPayout, feeRate: feeConfig.rate }
     });
 
     trade.status = 'completed';

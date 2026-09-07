@@ -11,6 +11,7 @@ const { requireVerifiedKycForTransactions } = require('../middleware/kyc');
 const { getGiftCardConfig, findSupportedCard } = require('../utils/giftcards');
 const { withTransaction } = require('../utils/database');
 const { AppError } = require('../utils/errorHandler');
+const { getConfiguredFee, recordPlatformFee } = require('../services/monetization');
 
 const ELECTRICITY_SERVICE_IDS = {
   ikedc: 'ikeja-electric',
@@ -160,13 +161,15 @@ async function completeBillPayment({
   description,
   metadata
 }) {
-  return withTransaction(async (session) => {
+  const feeConfig = await getConfiguredFee('billPaymentFee', amount, { currency: 'NGN' });
+  const totalDebit = Number((Number(amount) + feeConfig.fee).toFixed(2));
+  const result = await withTransaction(async (session) => {
     const sessionUser = await User.findById(userId).session(session);
     if (!sessionUser) {
       throw new AppError('User not found', 404);
     }
 
-    if (Number(sessionUser.balances.NGN || 0) < Number(amount)) {
+    if (Number(sessionUser.balances.NGN || 0) < totalDebit) {
       throw new AppError('Insufficient NGN balance', 400);
     }
 
@@ -178,10 +181,12 @@ async function completeBillPayment({
       description,
       status: 'completed',
       reference,
+      fee: feeConfig.fee,
+      feeCurrency: 'NGN',
       metadata
     });
 
-    sessionUser.balances.NGN = Number((Number(sessionUser.balances.NGN || 0) - Number(amount)).toFixed(2));
+    sessionUser.balances.NGN = Number((Number(sessionUser.balances.NGN || 0) - totalDebit).toFixed(2));
 
     await Promise.all([
       transaction.save({ session }),
@@ -190,6 +195,18 @@ async function completeBillPayment({
 
     return { user: sessionUser, transaction };
   });
+
+  await recordPlatformFee({
+    fee: feeConfig.fee,
+    currency: 'NGN',
+    reference,
+    sourceType: 'bill_payment',
+    sourceId: result.transaction._id,
+    userId,
+    metadata: { billType: metadata?.billType || type, feeRate: feeConfig.rate }
+  });
+
+  return result;
 }
 
 // Get all providers

@@ -51,10 +51,6 @@ function hashOtp(code) {
 async function issueEmailOtp(user, purpose) {
   const code = generateOtpCode();
   const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
-  const delivery = await emailService.sendOtpEmail({ to: user.email, code, purpose });
-  if (!delivery.success) {
-    throw new Error(delivery.error || 'Email delivery failed');
-  }
 
   await EmailOtp.deleteMany({ email: user.email, purpose, consumedAt: null });
   await EmailOtp.create({
@@ -64,6 +60,11 @@ async function issueEmailOtp(user, purpose) {
     codeHash: hashOtp(code),
     expiresAt
   });
+
+  const delivery = await emailService.sendOtpEmail({ to: user.email, code, purpose });
+  if (!delivery.success) {
+    throw new Error(delivery.error || 'Email delivery failed');
+  }
 
   return { expiresAt, delivered: true };
 }
@@ -248,7 +249,8 @@ router.post('/register', [
       message: 'User registered successfully',
       token,
       user: sanitizeUser(user, referral),
-      emailVerificationSent
+      emailVerificationSent,
+      requiresEmailVerification: user.emailVerified !== true
     });
   } catch (error) {
     console.error('Registration error:', error);

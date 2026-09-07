@@ -10,10 +10,9 @@ const DEFAULT_PLATFORM_SETTINGS = {
   fees: {
     swapFee: 0.5,
     bridgeFee: 1,
-    withdrawalFee: 0.5,
+    withdrawalFee: 50,
     depositFee: 0,
-    virtualCardCreationFee: 10,
-    virtualCardMonthlyFee: 2,
+    transferFee: 0.1,
     giftCardFee: 2,
     billPaymentFee: 1,
     p2pCryptoFeeRate: Number(process.env.P2P_CRYPTO_FEE_RATE || 0.0025),

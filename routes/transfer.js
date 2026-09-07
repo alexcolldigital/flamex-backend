@@ -11,6 +11,7 @@ const { AppError, handleError, asyncHandler } = require('../utils/errorHandler')
 const { withTransaction } = require('../utils/database');
 const { storeOTP, sendOTPEmail, verifyOTP, requires2FA } = require('../utils/twoFA');
 const Logger = require('../utils/logger');
+const { getConfiguredFee, recordPlatformFee } = require('../services/monetization');
 
 function getAvailableBalance(user, currency) {
   const currencyUpper = String(currency || '').toUpperCase();
@@ -150,7 +151,8 @@ router.post('/username', authMiddleware, requireTransactionPinSet, requireVerifi
     sender = await User.findById(req.userId); // Refresh sender after OTP verification
   }
 
-  const fee = Number(Math.max(0.01, amount * 0.001).toFixed(8)); // 0.1% fee, minimum 0.01
+  const feeConfig = await getConfiguredFee('transferFee', amount, { currency: currencyUpper });
+  const fee = Number(Math.max(0.01, feeConfig.fee).toFixed(8));
   const netAmount = Number((amount - fee).toFixed(8));
   if (netAmount <= 0) {
     throw new AppError('Transfer amount is too small after fees', 400);
@@ -241,6 +243,16 @@ router.post('/username', authMiddleware, requireTransactionPinSet, requireVerifi
     ]);
 
     logger.info(`Transfer completed: ${reference}, sender: ${sessionSender._id}, recipient: ${sessionRecipient._id}, amount: ${amount} ${currencyUpper}`);
+
+    await recordPlatformFee({
+      fee,
+      currency: currencyUpper,
+      reference,
+      sourceType: 'user_transfer',
+      sourceId: transfer._id,
+      userId: sessionSender._id,
+      metadata: { feeRate: feeConfig.rate, senderUserId: sessionSender._id, recipientUserId: sessionRecipient._id }
+    });
 
     // Send notifications
     await Promise.all([

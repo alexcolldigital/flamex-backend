@@ -11,6 +11,7 @@ const { AppError, handleError, asyncHandler } = require('../utils/errorHandler')
 const { withTransaction } = require('../utils/database');
 const { storeOTP, sendOTPEmail, verifyOTP, requires2FA } = require('../utils/twoFA');
 const Logger = require('../utils/logger');
+const { getConfiguredFee, recordPlatformFee } = require('../services/monetization');
 
 const BANKS = [
   { id: '044', name: 'Access Bank', code: '044' },
@@ -183,7 +184,8 @@ router.post(['/ngn', '/usd'], authMiddleware, requireTransactionPinSet, requireV
     user = await User.findById(req.userId);
   }
 
-  const fee = currency === 'NGN' && amount < 10000 ? 50 : 0;
+  const feeConfig = await getConfiguredFee('withdrawalFee', amount, { currency, percentage: false });
+  const fee = currency === 'NGN' ? feeConfig.fee : 0;
   if (amount <= fee) {
     throw new AppError('Withdrawal amount must be greater than the fee', 400);
   }
@@ -283,6 +285,16 @@ router.post(['/ngn', '/usd'], authMiddleware, requireTransactionPinSet, requireV
     },
     { new: true }
   );
+
+  await recordPlatformFee({
+    fee,
+    currency,
+    reference,
+    sourceType: 'withdrawal',
+    sourceId: transaction._id,
+    userId: debitResult.userId,
+    metadata: { provider: 'flutterwave', feeType: 'fixed' }
+  });
 
   const notificationUser = await User.findById(debitResult.userId);
   await createNotification({

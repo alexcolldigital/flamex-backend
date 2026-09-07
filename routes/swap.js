@@ -9,6 +9,7 @@ const lifiService = require('../services/lifi');
 const { withTransaction } = require('../utils/database');
 const { AppError } = require('../utils/errorHandler');
 const emailService = require('../services/email');
+const { getConfiguredFee, recordPlatformFee } = require('../services/monetization');
 
 const JUPITER_API = 'https://quote-api.jup.ag/v6';
 const EVM_NATIVE_TOKEN = '0x0000000000000000000000000000000000000000';
@@ -91,6 +92,7 @@ router.get('/quote', authMiddleware, async (req, res) => {
       }
 
       const quoteAmount = Math.round(normalizedAmount * (10 ** resolvedFromToken.decimals));
+      const feeConfig = await getConfiguredFee('swapFee', normalizedAmount, { currency: resolvedFromToken.symbol });
 
       const response = await axios.get(`${JUPITER_API}/quote`, {
         params: {
@@ -112,7 +114,10 @@ router.get('/quote', authMiddleware, async (req, res) => {
         priceImpact: response.data.priceImpactPct,
         route: response.data.routePlan,
         provider: 'jupiter',
-        slippage
+        slippage,
+        fee: feeConfig.fee,
+        feeCurrency: feeConfig.currency,
+        feeRate: feeConfig.rate
       });
     }
 
@@ -138,6 +143,8 @@ router.get('/quote', authMiddleware, async (req, res) => {
       });
 
       if (lifiQuote.success) {
+        const feeKey = fromChain === toChain ? 'swapFee' : 'bridgeFee';
+        const feeConfig = await getConfiguredFee(feeKey, Number(fromAmount), { currency: resolvedFromToken?.symbol || fromToken });
         const estimate = lifiQuote.quote?.estimate || {};
         const toAmountRaw = estimate.toAmount || lifiQuote.quote?.toAmount || '0';
         const minReceivedRaw = estimate.toAmountMin || toAmountRaw;
@@ -159,6 +166,10 @@ router.get('/quote', authMiddleware, async (req, res) => {
             ? ((Number(estimate.toAmountUSD) / Number(estimate.fromAmountUSD) - 1) * 100).toFixed(2)
             : '0',
           quote: lifiQuote.quote
+          , fee: feeConfig.fee,
+          feeCurrency: feeConfig.currency,
+          feeRate: feeConfig.rate,
+          feeType: feeKey
         });
       }
     }
@@ -206,6 +217,9 @@ router.post('/execute', authMiddleware, requireTransactionPinSet, [
     const creditAmount = Number(toAmount);
     const fromSymbol = String(fromToken).toUpperCase();
     const toSymbol = String(toToken).toUpperCase();
+    const feeKey = fromChain === toChain ? 'swapFee' : 'bridgeFee';
+    const feeConfig = await getConfiguredFee(feeKey, debitAmount, { currency: fromSymbol });
+    const totalDebit = Number((debitAmount + feeConfig.fee).toFixed(8));
 
     if (!debitAmount || debitAmount <= 0) {
       return res.status(400).json({ message: 'Invalid swap amount' });
@@ -221,7 +235,7 @@ router.post('/execute', authMiddleware, requireTransactionPinSet, [
 
     const currentBalance = getAvailableBalance(user, fromSymbol);
 
-    if (currentBalance < debitAmount) {
+    if (currentBalance < totalDebit) {
       return res.status(400).json({ message: `Insufficient available ${fromToken} balance` });
     }
 
@@ -248,17 +262,20 @@ router.post('/execute', authMiddleware, requireTransactionPinSet, [
         toCurrency: toSymbol,
         fromAmount: debitAmount,
         toAmount: creditAmount,
+        fee: feeConfig.fee,
+        feeCurrency: fromSymbol,
         fromChainId: fromChain,
         toChainId: toChain,
         description: `Swap ${debitAmount} ${fromSymbol} to ${toSymbol}`,
         status: 'completed',
         reference,
         metadata: {
-          executionMode: fromChain === toChain ? 'internal_ledger_swap' : 'internal_ledger_cross_chain_credit'
+          executionMode: fromChain === toChain ? 'internal_ledger_swap' : 'internal_ledger_cross_chain_credit',
+          platformFeeType: feeKey
         }
       });
 
-      sessionUser.balances[fromSymbol] = Number((Number(sessionUser.balances[fromSymbol] || 0) - debitAmount).toFixed(8));
+      sessionUser.balances[fromSymbol] = Number((Number(sessionUser.balances[fromSymbol] || 0) - totalDebit).toFixed(8));
       sessionUser.balances[toSymbol] = Number((Number(sessionUser.balances[toSymbol] || 0) + creditAmount).toFixed(8));
 
       await Promise.all([
@@ -267,6 +284,16 @@ router.post('/execute', authMiddleware, requireTransactionPinSet, [
       ]);
 
       return { transaction };
+    });
+
+    await recordPlatformFee({
+      fee: feeConfig.fee,
+      currency: fromSymbol,
+      reference,
+      sourceType: feeKey,
+      sourceId: transaction._id,
+      userId: req.userId,
+      metadata: { debitAmount, feeRate: feeConfig.rate }
     });
 
     res.json({

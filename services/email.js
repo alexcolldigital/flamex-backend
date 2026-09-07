@@ -15,6 +15,9 @@ class EmailService {
           host: this.host,
           port: this.port,
           secure: this.secure,
+          connectionTimeout: 10000,
+          greetingTimeout: 10000,
+          socketTimeout: 15000,
           auth: {
             user: this.user,
             pass: this.pass

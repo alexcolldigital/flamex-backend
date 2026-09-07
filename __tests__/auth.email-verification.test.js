@@ -85,6 +85,8 @@ describe('email verification', () => {
 
     expect(response.status).toBe(503);
     expect(response.body.message).toMatch(/unable to send verification code/i);
+    expect(mockOtpRecord.codeHash).toMatch(/^[a-f0-9]{64}$/);
+    expect(mockOtpRecord.expiresAt.getTime()).toBeGreaterThan(Date.now());
   });
 
   test('rejects an incorrect OTP without verifying the user', async () => {
