@@ -194,12 +194,10 @@ router.post('/register', [
 
     let emailVerificationSent = user.emailVerified === true;
     if (!user.emailVerified) {
-      try {
-        await issueEmailOtp(user, 'verify_email');
-        emailVerificationSent = true;
-      } catch (error) {
+      emailVerificationSent = true;
+      issueEmailOtp(user, 'verify_email').catch((error) => {
         console.error('Initial email verification delivery failed:', error.message);
-      }
+      });
     }
 
     let referredBy = null;
